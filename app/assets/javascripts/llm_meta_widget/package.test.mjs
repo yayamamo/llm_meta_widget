@@ -24,7 +24,9 @@ const BUNDLE = "app/assets/javascripts/llm_meta_widget/llm-meta-widget.js"
 
 function packed() {
   const out = execFileSync("npm", [ "pack", "--dry-run", "--json" ], { cwd: ROOT, encoding: "utf8" })
-  return JSON.parse(out)[0].files.map((f) => f.path)
+  const result = JSON.parse(out)
+  const entry = Array.isArray(result) ? result[0] : Object.values(result)[0]
+  return entry.files.map((f) => f.path)
 }
 
 test("the tarball ships the bundle and the orchestrator, and nothing unexpected", () => {
