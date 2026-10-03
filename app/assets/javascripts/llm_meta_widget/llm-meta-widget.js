@@ -4170,13 +4170,29 @@ function boot(cfg) {
     if (role === "error") return "\u26A0 error";
     return role;
   }
-  function markWorking(label) {
-    if (!label || label.classList.contains("is-working")) return;
-    label.innerHTML = '<span class="role-spinner" aria-hidden="true">\u2699\uFE0F</span> Working\u2026';
-    label.classList.add("is-working");
+  var workingStates = /* @__PURE__ */ new WeakMap();
+  function markWorking(label, phase) {
+    if (!label) return;
+    var state = workingStates.get(label);
+    if (!state) {
+      label.innerHTML = '<span class="role-spinner" aria-hidden="true">\u2699\uFE0F</span> <span class="lmw-working-phase" role="status" aria-live="polite"></span> <span class="lmw-working-elapsed" aria-hidden="true"></span>';
+      label.classList.add("is-working");
+      state = { started: Date.now(), timer: null };
+      var updateElapsed = function() {
+        var seconds = Math.floor((Date.now() - state.started) / 1e3);
+        label.querySelector(".lmw-working-elapsed").textContent = "\uFF08" + Math.floor(seconds / 60) + "\u5206" + seconds % 60 + "\u79D2\u7D4C\u904E\uFF09";
+      };
+      updateElapsed();
+      state.timer = setInterval(updateElapsed, 1e3);
+      workingStates.set(label, state);
+    }
+    label.querySelector(".lmw-working-phase").textContent = phase || "\u56DE\u7B54\u3092\u6E96\u5099\u3057\u3066\u3044\u307E\u3059\u2026";
   }
   function markDone(label) {
-    if (!label || !label.classList.contains("is-working")) return;
+    if (!label) return;
+    var state = workingStates.get(label);
+    if (state) clearInterval(state.timer);
+    workingStates.delete(label);
     label.classList.remove("is-working");
     label.textContent = roleLabel("assistant");
   }
@@ -4330,6 +4346,7 @@ function boot(cfg) {
     liveChips = null;
     pendingChips = [];
     markWorking(assistantBody.roleLabel);
+    var currentRound = 0;
     var assistantMarkdown = "";
     try {
       await wellKnownReady;
@@ -4351,17 +4368,21 @@ function boot(cfg) {
         provider: LLM_PROVIDER === "ollama" ? "ollama" : "hub",
         signal: currentAbort.signal,
         onToolCall: function(toolCall) {
+          markWorking(assistantBody.roleLabel, "\u30C4\u30FC\u30EB\u3092\u5B9F\u884C\u3057\u3066\u3044\u307E\u3059\u2026");
           announceToolCall(toolCall);
         },
         onToolDispatched: function(outcome) {
           resolveToolCall(outcome);
+          markWorking(assistantBody.roleLabel, "\u30C4\u30FC\u30EB\u7D50\u679C\u3092\u3082\u3068\u306B\u56DE\u7B54\u3092\u6E96\u5099\u3057\u3066\u3044\u307E\u3059\u2026");
         },
         onPhase: function(name) {
-          if (name === "responding") markDone(assistantBody.roleLabel);
-          else markWorking(assistantBody.roleLabel);
+          if (name === "responding") markWorking(assistantBody.roleLabel, "\u56DE\u7B54\u3092\u751F\u6210\u3057\u3066\u3044\u307E\u3059\u2026");
+          else if (name === "tool_execution") markWorking(assistantBody.roleLabel, "\u30C4\u30FC\u30EB\u3092\u5B9F\u884C\u3057\u3066\u3044\u307E\u3059\u2026");
+          else markWorking(assistantBody.roleLabel, currentRound > 0 ? "\u30C4\u30FC\u30EB\u7D50\u679C\u3092\u3082\u3068\u306B\u56DE\u7B54\u3092\u751F\u6210\u3057\u3066\u3044\u307E\u3059\u2026" : "\u30E2\u30C7\u30EB\u306E\u5FDC\u7B54\u3092\u5F85\u3063\u3066\u3044\u307E\u3059\u2026");
         },
         onRoundStart: function(roundIdx) {
-          markWorking(assistantBody.roleLabel);
+          currentRound = roundIdx;
+          markWorking(assistantBody.roleLabel, roundIdx > 0 ? "\u30C4\u30FC\u30EB\u7D50\u679C\u3092\u3082\u3068\u306B\u56DE\u7B54\u3092\u751F\u6210\u3057\u3066\u3044\u307E\u3059\u2026" : "\u30E2\u30C7\u30EB\u306E\u5FDC\u7B54\u3092\u5F85\u3063\u3066\u3044\u307E\u3059\u2026");
           collapseThinkingBlock();
         },
         onThinkingDelta: function(delta) {
@@ -4371,7 +4392,7 @@ function boot(cfg) {
           historyEl.scrollTop = historyEl.scrollHeight;
         },
         onTextDelta: function(delta) {
-          markDone(assistantBody.roleLabel);
+          markWorking(assistantBody.roleLabel, "\u56DE\u7B54\u3092\u751F\u6210\u3057\u3066\u3044\u307E\u3059\u2026");
           collapseThinkingBlock();
           assistantMarkdown += delta;
           renderMarkdownInto(assistantBody, assistantMarkdown);
