@@ -361,3 +361,12 @@
 	#llm-meta-widget-chat .lmw-send:hover { background-color: #2563eb; }
 	#llm-meta-widget-chat .lmw-send:disabled { opacity: 0.5; cursor: not-allowed; }
 	#llm-meta-widget-chat .lmw-send svg { display: block; }
+
+/* Author CSS must not override hidden on the login gate. */
+#llm-meta-widget-chat [hidden] { display: none !important; }
+#llm-meta-widget-chat .lmw-auth-notice {
+  padding: 16px; margin: 8px; border: 1px solid #93c5fd;
+  border-radius: 8px; background: #eff6ff; line-height: 1.6;
+}
+#llm-meta-widget-chat .lmw-auth-message { margin: 0 0 12px; }
+#llm-meta-widget-chat .lmw-auth-link { color: #1d4ed8; text-decoration: underline; }

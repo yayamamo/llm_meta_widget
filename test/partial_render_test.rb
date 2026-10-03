@@ -99,5 +99,11 @@ check("renders max-rounds and the globals") do
     html.include?('actions-global="aiActions"')
 end
 
+check("login guidance is omitted by default and escapes configured content") do
+  out = render(auth_required: true, auth_url: "https://hub.example/", auth_message: 'Sign in "now" <please>')
+  !html.include?('auth-required="true"') && out.include?('auth-required="true"') &&
+    out.include?('auth-url="https://hub.example/"') && out.include?('auth-message="Sign in &quot;now&quot; &lt;please&gt;"')
+end
+
 puts($failures.zero? ? "\nall checks passed" : "\n#{$failures} FAILED")
 exit($failures.zero? ? 0 : 1)

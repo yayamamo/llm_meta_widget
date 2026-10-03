@@ -122,5 +122,10 @@ check("a greeting with quotes and angle brackets arrives intact") do
   roundtrip(greeting: g)["GREETING"] == g
 end
 
+check("login gate and guidance survive the helper-to-element round trip") do
+  c = read_config(attributes_of(render(auth_required: true, auth_url: "https://hub.example/", auth_message: "Googleで認証してください。")))
+  c["AUTH_REQUIRED"] == true && c["AUTH_URL"] == "https://hub.example/" && c["AUTH_MESSAGE"] == "Googleで認証してください。"
+end
+
 puts($failures.zero? ? "\nall checks passed" : "\n#{$failures} FAILED")
 exit($failures.zero? ? 0 : 1)

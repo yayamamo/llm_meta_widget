@@ -1,0 +1,84 @@
+<!doctype html>
+<html lang="ja">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>TogoMCP チャット</title>
+</head>
+<body>
+  <h1>TogoMCP チャット</h1>
+  <p>初回は<a href="https://hub.aibranch.org/" target="_blank" rel="noopener noreferrer">hubの認証ページ</a>で登録し、その後このページでも同じGoogleアカウントで認証してください。</p>
+  <div id="google-signin"></div>
+  <p id="login-status" role="status">Google認証を準備しています。</p>
+  <button id="logout" type="button" hidden>このページからログアウト</button>
+
+  <!-- Copy the built bundle to this static asset URL. -->
+  <script type="module" src="./assets/llm-meta-widget.js"></script>
+  <llm-meta-widget id="togomcp-chat"
+    llm-url="https://hub.aibranch.org"
+    tool-hub-url="https://hub.aibranch.org"
+    model="qwen3-8-27b-fast"
+    hub-tools="TogoMCP"
+    enable-model-picker="false"
+    well-known-urls=""
+    auth-required="true"
+    auth-url="https://hub.aibranch.org/"
+    auth-message="チャットにはGoogle認証が必要です。初めての方は認証ページでhubに登録してください。登録後は、このページ上部のGoogleボタンでも認証してください。">
+  </llm-meta-widget>
+
+  <script type="module">
+    // A client ID is public configuration; never put a client secret here.
+    const CLIENT_ID = 'REPLACE_WITH_GOOGLE_CLIENT_ID.apps.googleusercontent.com';
+    const status = document.querySelector('#login-status');
+    await customElements.whenDefined('llm-meta-widget');
+    const widget = document.querySelector('#togomcp-chat');
+    const logout = document.querySelector('#logout');
+    let expiryTimer;
+    function clearLogin() {
+      clearTimeout(expiryTimer);
+      widget.bearerToken = null;
+      logout.hidden = true;
+      status.textContent = 'Googleボタンから認証してください。';
+      // Clear the current tab's transcript when changing accounts.
+      widget.querySelector('.lmw-clear')?.click();
+    }
+    logout.onclick = () => {
+      clearLogin();
+      google.accounts.id.disableAutoSelect();
+    };
+    if (CLIENT_ID.startsWith('REPLACE_')) {
+      status.textContent = '管理者によるGoogleクライアントIDの設定が必要です。';
+    } else {
+      try {
+        await new Promise((resolve, reject) => {
+          const script = document.createElement('script');
+          script.src = 'https://accounts.google.com/gsi/client';
+          script.onload = resolve;
+          script.onerror = reject;
+          document.head.appendChild(script);
+        });
+        google.accounts.id.initialize({
+          client_id: CLIENT_ID,
+          callback: response => {
+            clearLogin();
+            widget.bearerToken = response.credential;
+            status.textContent = '認証情報を受け取りました。チャットを利用できます。hubが認証情報を検証します。';
+            logout.hidden = false;
+            // Expiry is a UI timer, not verification. The hub verifies the JWT.
+            try {
+              const payload = JSON.parse(atob(response.credential.split('.')[1].replace(/-/g, '+').replace(/_/g, '/')));
+              expiryTimer = setTimeout(clearLogin, Math.max(0, payload.exp * 1000 - Date.now()));
+            } catch { /* hub will reject invalid credentials */ }
+          }
+        });
+        google.accounts.id.renderButton(document.querySelector('#google-signin'), {
+          type: 'standard', theme: 'outline', size: 'large'
+        });
+        status.textContent = 'Googleボタンから認証してください。';
+      } catch {
+        status.textContent = 'Google認証を読み込めませんでした。ページを再読み込みしてください。';
+      }
+    }
+  </script>
+</body>
+</html>

@@ -25,6 +25,7 @@ import { runChatLoop, fetchMcpManifest, listMcpPrompts, getMcpPrompt,
          createConversationStore, conversationKeyFor } from "./orchestrator.js";
 import { marked } from "./marked.esm.js";
 import { readConfig } from "./config.js";
+import { safeAuthUrl, authenticationFailed } from "./auth.js";
 import conversationCss from "../../stylesheets/llm_meta_widget/conversation.css";
 import panelCss from "../../stylesheets/llm_meta_widget/panel.css";
 
@@ -47,6 +48,10 @@ const MARKUP = `
 			<button type="button" class="lmw-clear" title="Clear conversation">clear</button>
 			<button type="button" class="lmw-hide" title="Hide">−</button>
 		</div>
+  </div>
+  <div class="lmw-auth-notice" role="status" hidden>
+    <p class="lmw-auth-message"></p>
+    <a class="lmw-auth-link" target="_blank" rel="noopener noreferrer">認証ページを開く</a>
 	</div>
 	<div class="lmw-messages"></div>
 	<div class="lmw-input-container">
@@ -89,6 +94,14 @@ function injectStylesOnce(doc) {
 }
 
 export class LlmMetaWidgetElement extends HTMLElement {
+  // Set by the host's Google Identity Services callback, kept only in memory.
+  // Await customElements.whenDefined before assigning this property.
+  get bearerToken() { return this.__lmwBearerToken || null; }
+  set bearerToken(value) {
+    this.__lmwBearerToken = typeof value === "string" && value.trim() ? value.trim() : null;
+    this.__lmwAuthChanged?.();
+  }
+
   connectedCallback() {
     if (this.__lmwWired) return;             // moving the node must not re-boot
     this.__lmwWired = true;
@@ -107,7 +120,7 @@ export class LlmMetaWidgetElement extends HTMLElement {
 
     injectStylesOnce(document);
     this.insertAdjacentHTML("beforeend", MARKUP);
-    boot(readConfig(this));
+    boot(readConfig(this), this);
   }
 }
 
@@ -123,7 +136,7 @@ function dropNode(node) {
 	if (node && node.parentNode) node.parentNode.removeChild(node);
 }
 
-function boot(cfg) {
+function boot(cfg, host) {
   var LLM_BASE               = cfg.LLM_BASE;
   var TOOL_HUB_BASE          = cfg.TOOL_HUB_BASE;
   var API_KEY_UUID           = cfg.API_KEY_UUID;
@@ -147,6 +160,35 @@ function boot(cfg) {
   	var formEl       = root.querySelector(".lmw-form");
   	var inputEl      = root.querySelector(".lmw-input");
   	var clearBtn     = root.querySelector(".lmw-clear");
+  var authNotice = root.querySelector(".lmw-auth-notice");
+  var authLink = root.querySelector(".lmw-auth-link");
+  var inputContainer = root.querySelector(".lmw-input-container");
+  root.querySelector(".lmw-auth-message").textContent = cfg.AUTH_MESSAGE;
+  var loginUrl = safeAuthUrl(cfg.AUTH_URL, LLM_BASE);
+  if (loginUrl) authLink.href = loginUrl;
+  else authLink.hidden = true;
+
+  function loginRequired() { return cfg.AUTH_REQUIRED && !host.bearerToken; }
+  function hubHeaders() {
+    var headers = { Accept: "application/json" };
+    if (host.bearerToken) headers.Authorization = "Bearer " + host.bearerToken;
+    return headers;
+  }
+  function updateAuthUi() {
+    var locked = loginRequired();
+    authNotice.hidden = !locked;
+    inputContainer.hidden = locked;
+    historyEl.hidden = locked;
+    inputEl.disabled = locked;
+    root.querySelector(".lmw-send").disabled = locked;
+    if (locked && currentAbort) currentAbort.abort();
+  }
+  host.__lmwAuthChanged = function() {
+    updateAuthUi();
+    if (!loginRequired()) loadHubResourcesForPickers();
+  };
+  updateAuthUi();
+
   	var hideBtn      = root.querySelector(".lmw-hide");
   	// The ERB partial omitted these nodes entirely when their flag was false.
   	// One static template cannot express that, so prune instead — otherwise a
@@ -351,6 +393,7 @@ function boot(cfg) {
   	}
 
   	async function loadHubResourcesForPickers() {
+    if (loginRequired()) return;
   		// Called once on first widget open (idempotent — pickerLoaded flag
   		// below). Fetches models + MCP servers from the hub's anon endpoints
   		// and populates each picker. Non-fatal if either fetch fails (widget
@@ -377,7 +420,7 @@ function boot(cfg) {
   				if (flat.length > 1) modelPicker.style.display = "";
   			}));
   		} else if (ENABLE_MODEL_PICKER && modelPicker) {
-  			tasks.push(fetch(LLM_BASE + "/api/llms", { headers: { "Accept": "application/json" } })
+        tasks.push(fetch(LLM_BASE + "/api/llms", { headers: hubHeaders() })
   				.then(function(r) { return r.ok ? r.json() : { llms: [] }; })
   				.then(function(payload) {
   					// /api/llms is heterogeneous per family:
@@ -414,7 +457,7 @@ function boot(cfg) {
   		}
 
   		if (ENABLE_TOOL_PICKER && toolsListEl) {
-  			tasks.push(fetch(TOOL_HUB_BASE + "/api/mcp_servers", { headers: { "Accept": "application/json" } })
+        tasks.push(fetch(TOOL_HUB_BASE + "/api/mcp_servers", { headers: hubHeaders() })
   				.then(function(r) { return r.ok ? r.json() : { mcp_servers: [] }; })
   				.then(function(payload) {
   					hubMcpServers = (payload.mcp_servers || []).filter(function(s) {
@@ -1020,6 +1063,7 @@ function boot(cfg) {
 
   	formEl.addEventListener("submit", async function(event) {
   		event.preventDefault();
+    if (loginRequired()) { updateAuthUi(); return; }
   		var userText = inputEl.value.trim();
   		if (!userText) return;
   		inputEl.value = "";
@@ -1053,6 +1097,7 @@ function boot(cfg) {
   				baseUrl:       LLM_BASE,
   				toolHubUrl:    TOOL_HUB_BASE,
   				apiKeyUuid:    API_KEY_UUID,
+        bearerToken:   host.bearerToken,
   				modelName:     MODEL,
   				messages:      messages,
   				localTools:    localTools,
@@ -1138,6 +1183,7 @@ function boot(cfg) {
   					"The reply above may be incomplete — try asking again or rephrasing.");
   			}
   		} catch (err) {
+      if (cfg.AUTH_REQUIRED && authenticationFailed(err)) host.bearerToken = null;
   			if (err.name === "AbortError" || /aborted/i.test(err.message || "")) {
   				appendTurn("system", "⏹ stopped");
   			} else {

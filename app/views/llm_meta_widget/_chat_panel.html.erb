@@ -22,6 +22,9 @@
 <llm-meta-widget
   llm-url="<%= llm_url %>"
   model="<%= model %>"
+  <%= auth_required ? 'auth-required="true"'.html_safe : "" %>
+  <%= tag_attr("auth-url", auth_url) %>
+  <%= tag_attr("auth-message", auth_message) %>
   <%= tag_attr("tool-hub-url", tool_hub_url) %>
   <%= tag_attr("llm-provider", llm_provider) %>
   <%= tag_attr("api-key-uuid", api_key_uuid) %>

@@ -112,6 +112,23 @@ Once that works, the widget can converse but cannot *do* anything. To let the
 LLM act on your page or call your own services, declare tools using any of the
 **three tool classes** below.
 
+## Login guidance and TogoMCP deployment
+
+Static hosts can opt into a login gate with `auth-required="true"`,
+`auth-url="https://hub.aibranch.org/"` and an optional `auth-message`.
+Without credentials, the panel shows the message/link and disables chat.
+After `customElements.whenDefined("llm-meta-widget")`, the host's Google
+Identity Services callback can assign `widget.bearerToken = response.credential`.
+Set it to `null` on logout. Tokens stay in memory; do not put them in attributes.
+The hub verifies the token. A hub login in another tab does not supply it to
+this page. Authentication errors return the panel to the login guidance.
+
+Anonymous operation remains the default (`auth-required` omitted or `"false"`).
+The gate is UI state, not server-side access control.
+See [TogoMCP deployment](docs/togomcp-deployment.md) for Google client ID setup,
+public hub prerequisites, and the transition to protected anonymous operation.
+A static Google login example is [examples/togomcp-google-login.html](examples/togomcp-google-login.html).
+
 ## Non-Rails hosts: write the element yourself
 
 **If your app is Rails, you can skip this section.** The gem already does

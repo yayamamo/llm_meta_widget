@@ -23,6 +23,9 @@ module LlmMetaWidget
   # (page-embedded aiActions / host-wide well-known / hub-registered).
   module WidgetHelper
     DEFAULTS = {
+      auth_required:           false,
+      auth_url:                nil,
+      auth_message:            nil,
       api_key_uuid:            "ollama-local",   # llm_meta_server provider only
       # Answering the chat and registering tools are separate jobs. Name each
       # endpoint for the job it does; neither implies the other.

@@ -127,12 +127,12 @@ test("max-rounds parses, and a non-number falls back rather than becoming NaN", 
 
 // --- shape -----------------------------------------------------------------
 
-test("returns exactly the sixteen keys the panel logic reads", () => {
+test("returns exactly the configuration keys the panel logic reads", () => {
   // The logic moved from the ERB template unchanged, so it still reads these
   // names. A key going missing here would surface as an undefined deep inside
   // the panel rather than as a clear error.
   assert.deepEqual(Object.keys(readConfig(el(MINIMAL))).sort(), [
-    "ACTIONS_GLOBAL", "ACTIONS_SCHEMA_ID", "API_KEY_UUID", "ENABLE_MODEL_PICKER",
+    "ACTIONS_GLOBAL", "ACTIONS_SCHEMA_ID", "API_KEY_UUID", "AUTH_MESSAGE", "AUTH_REQUIRED", "AUTH_URL", "ENABLE_MODEL_PICKER",
     "ENABLE_TOOL_PICKER", "GREETING", "HUB_TOOLS_ALLOWLIST", "LLM_BASE",
     "LLM_PROVIDER", "MAX_ROUNDS", "MODEL", "MODEL_ALLOWLIST",
     "REMOTE_TOOLS_SCHEMA_ID", "STATE_GLOBAL", "TOOL_HUB_BASE", "WELL_KNOWN_URLS",
@@ -146,4 +146,13 @@ test("tolerates being handed nothing at all", () => {
   assert.equal(c.LLM_BASE, null)
   assert.equal(c.MODEL, null)
   assert.equal(c.MAX_ROUNDS, DEFAULTS.MAX_ROUNDS)
+})
+
+test('login gate is opt-in and accepts configurable guidance', () => {
+  assert.equal(readConfig(el(MINIMAL)).AUTH_REQUIRED, false)
+  const c = readConfig(el({...MINIMAL, 'auth-required': 'true', 'auth-url': 'https://hub.example/', 'auth-message': 'ログインしてください。'}))
+  assert.equal(c.AUTH_REQUIRED, true)
+  assert.equal(c.AUTH_URL, 'https://hub.example/')
+  assert.equal(c.AUTH_MESSAGE, 'ログインしてください。')
+  assert.equal(readConfig(el({...MINIMAL, 'auth-required': 'false'})).AUTH_REQUIRED, false)
 })
