@@ -132,7 +132,7 @@ test("returns exactly the configuration keys the panel logic reads", () => {
   // names. A key going missing here would surface as an undefined deep inside
   // the panel rather than as a clear error.
   assert.deepEqual(Object.keys(readConfig(el(MINIMAL))).sort(), [
-    "ACTIONS_GLOBAL", "ACTIONS_SCHEMA_ID", "API_KEY_UUID", "AUTH_MESSAGE", "AUTH_REQUIRED", "AUTH_URL", "ENABLE_MODEL_PICKER",
+    "ACTIONS_GLOBAL", "ACTIONS_SCHEMA_ID", "API_KEY_UUID", "AUTH_MESSAGE", "AUTH_REQUIRED", "AUTH_URL", "DEFAULT_HUB_TOOLS", "ENABLE_MODEL_PICKER",
     "ENABLE_TOOL_PICKER", "GREETING", "HUB_TOOLS_ALLOWLIST", "LLM_BASE",
     "LLM_PROVIDER", "MAX_ROUNDS", "MODEL", "MODEL_ALLOWLIST",
     "REMOTE_TOOLS_SCHEMA_ID", "STATE_GLOBAL", "TOOL_HUB_BASE", "WELL_KNOWN_URLS",

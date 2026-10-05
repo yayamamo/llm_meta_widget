@@ -479,3 +479,5 @@ it most, since they must already know your form to press it.
 ## License
 
 Apache-2.0.
+
+`default-hub-tools="TogoMCP"` initially selects all active tools on the named hub server. Omit it to start with none selected. This is separate from the `hub-tools` visibility allowlist. Initial selection runs once per server; visitors can subsequently deselect tools.

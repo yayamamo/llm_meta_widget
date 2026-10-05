@@ -352,6 +352,7 @@ function boot(cfg, host) {
   	// state (all-on / indeterminate / all-off).
   	var hubMcpServers = [];
   	var selectedToolIds = new Set();
+    var initializedToolServers = new Set();
 
   	function anyAllowedByAllowlist(name, allowlist) {
   		return allowlist === null || allowlist.indexOf(name) >= 0;
@@ -362,6 +363,16 @@ function boot(cfg, host) {
   		// adapted to runChatLoop's expected { id, name, description, input_schema }.
   		var flat = [];
   		hubMcpServers.forEach(function(s) {
+              // Apply initial defaults once, so subsequent reloads preserve
+              // visitor changes and do not re-enable explicitly cleared tools.
+              var serverKey = s.uuid || s.name;
+              if (!initializedToolServers.has(serverKey)) {
+                initializedToolServers.add(serverKey);
+                if (cfg.DEFAULT_HUB_TOOLS && anyAllowedByAllowlist(s.name, cfg.DEFAULT_HUB_TOOLS)) {
+                  (s.tools || []).forEach(function(t) { if (t.active !== false) selectedToolIds.add(t.id); });
+                }
+              }
+
   			(s.tools || []).forEach(function(t) {
   				if (!selectedToolIds.has(t.id)) return;
   				flat.push({
@@ -472,6 +483,16 @@ function boot(cfg, host) {
   						return;
   					}
   					hubMcpServers.forEach(function(s) {
+              // Apply initial defaults once, so subsequent reloads preserve
+              // visitor changes and do not re-enable explicitly cleared tools.
+              var serverKey = s.uuid || s.name;
+              if (!initializedToolServers.has(serverKey)) {
+                initializedToolServers.add(serverKey);
+                if (cfg.DEFAULT_HUB_TOOLS && anyAllowedByAllowlist(s.name, cfg.DEFAULT_HUB_TOOLS)) {
+                  (s.tools || []).forEach(function(t) { if (t.active !== false) selectedToolIds.add(t.id); });
+                }
+              }
+
   						var serverBlock = document.createElement("div");
   						serverBlock.className = "lmw-tools-server";
 

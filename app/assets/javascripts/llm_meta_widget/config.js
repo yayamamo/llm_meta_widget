@@ -78,5 +78,6 @@ export function readConfig(el) {
     ENABLE_TOOL_PICKER:     bool("enable-tool-picker", true) && toolHub !== null,
     MODEL_ALLOWLIST:        list("models"),
     HUB_TOOLS_ALLOWLIST:    list("hub-tools"),
+    DEFAULT_HUB_TOOLS:      list("default-hub-tools"),
   };
 }

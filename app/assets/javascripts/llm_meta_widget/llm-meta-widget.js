@@ -2944,7 +2944,8 @@ function readConfig(el) {
     // .well-known MCP work regardless.
     ENABLE_TOOL_PICKER: bool("enable-tool-picker", true) && toolHub !== null,
     MODEL_ALLOWLIST: list2("models"),
-    HUB_TOOLS_ALLOWLIST: list2("hub-tools")
+    HUB_TOOLS_ALLOWLIST: list2("hub-tools"),
+    DEFAULT_HUB_TOOLS: list2("default-hub-tools")
   };
 }
 
@@ -3836,12 +3837,22 @@ function boot(cfg, host) {
   var remoteTools = remoteToolsEl ? JSON.parse(remoteToolsEl.textContent) : [];
   var hubMcpServers = [];
   var selectedToolIds = /* @__PURE__ */ new Set();
+  var initializedToolServers = /* @__PURE__ */ new Set();
   function anyAllowedByAllowlist(name, allowlist) {
     return allowlist === null || allowlist.indexOf(name) >= 0;
   }
   function refreshRemoteToolsFromPicker() {
     var flat = [];
     hubMcpServers.forEach(function(s) {
+      var serverKey = s.uuid || s.name;
+      if (!initializedToolServers.has(serverKey)) {
+        initializedToolServers.add(serverKey);
+        if (cfg.DEFAULT_HUB_TOOLS && anyAllowedByAllowlist(s.name, cfg.DEFAULT_HUB_TOOLS)) {
+          (s.tools || []).forEach(function(t) {
+            if (t.active !== false) selectedToolIds.add(t.id);
+          });
+        }
+      }
       (s.tools || []).forEach(function(t) {
         if (!selectedToolIds.has(t.id)) return;
         flat.push({
@@ -3945,6 +3956,15 @@ function boot(cfg, host) {
           return;
         }
         hubMcpServers.forEach(function(s) {
+          var serverKey = s.uuid || s.name;
+          if (!initializedToolServers.has(serverKey)) {
+            initializedToolServers.add(serverKey);
+            if (cfg.DEFAULT_HUB_TOOLS && anyAllowedByAllowlist(s.name, cfg.DEFAULT_HUB_TOOLS)) {
+              (s.tools || []).forEach(function(t) {
+                if (t.active !== false) selectedToolIds.add(t.id);
+              });
+            }
+          }
           var serverBlock = document.createElement("div");
           serverBlock.className = "lmw-tools-server";
           var headerRow = document.createElement("div");

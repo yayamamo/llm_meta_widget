@@ -755,7 +755,7 @@
 </section>
 
 <script type="module" src="/assets/llm-meta-widget.js"></script>
-<llm-meta-widget id="togomcp-chat" llm-url="https://hub.aibranch.org" tool-hub-url="https://hub.aibranch.org" model="qwen3-8-27b-fast" hub-tools="TogoMCP" enable-model-picker="false" well-known-urls="" auth-required="false" max-rounds="4" greeting="ログインせずにTogoMCPをお試しいただけます。"></llm-meta-widget>
+<llm-meta-widget id="togomcp-chat" llm-url="https://hub.aibranch.org" tool-hub-url="https://hub.aibranch.org" model="qwen3-8-27b-fast" hub-tools="TogoMCP" default-hub-tools="TogoMCP" enable-model-picker="false" well-known-urls="" auth-required="false" max-rounds="4" greeting="ログインせずにTogoMCPをお試しいただけます。"></llm-meta-widget>
 
 
 <!-- ==============================
@@ -1596,10 +1596,5 @@
 await customElements.whenDefined('llm-meta-widget');
 const widget=document.querySelector('llm-meta-widget');
 widget.querySelector('#llm-meta-widget-chat').insertAdjacentHTML('afterbegin','<p style="padding:10px 16px;background:#e8f1fb;color:#294a70;font-size:13px">ログイン不要のお試しチャットです。混雑時やサービス側の制限により利用できない場合があります。</p>');
-// Enable the configured TogoMCP server on first discovery; visitors can
-// subsequently change the selection in the Tools picker.
-let selected=false;
-const autoSelect=()=>{const bulk=widget.querySelector('.lmw-tools-server-bulk');if(bulk&&!selected){selected=true;if(!bulk.checked)bulk.click();observer.disconnect();}};
-const observer=new MutationObserver(autoSelect);observer.observe(widget,{childList:true,subtree:true});autoSelect();
 document.querySelectorAll('.open-chat').forEach(button=>button.onclick=()=>{const toggle=widget.querySelector('#llm-meta-widget-toggle');if(toggle && getComputedStyle(widget.querySelector('#llm-meta-widget-chat')).display === 'none')toggle.click();});
 </script></body><div id="codex-browser-sidebar-comments-root" style="position: fixed; inset: 0px; pointer-events: none; z-index: 2147483647;"></div></html>
