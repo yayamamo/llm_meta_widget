@@ -481,3 +481,5 @@ it most, since they must already know your form to press it.
 Apache-2.0.
 
 `default-hub-tools="TogoMCP"` initially selects all active tools on the named hub server. Omit it to start with none selected. This is separate from the `hub-tools` visibility allowlist. Initial selection runs once per server; visitors can subsequently deselect tools.
+
+`max-exchanges="4"` limits each conversation to four user submissions (default 4; positive integers only). Internal tool/LLM rounds do not count. A submission consumes an exchange even if it fails or is cancelled. The remaining count is restored with the transcript on reload. Clear starts a new conversation and resets it. This is a browser UI limit, not a server quota. `max-rounds` independently limits internal rounds for each question.

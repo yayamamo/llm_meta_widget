@@ -168,6 +168,22 @@ function boot(cfg, host) {
   if (loginUrl) authLink.href = loginUrl;
   else authLink.hidden = true;
 
+  var exchangeNotice = document.createElement("p");
+  exchangeNotice.className = "lmw-exchange-limit";
+  exchangeNotice.setAttribute("role", "status");
+  exchangeNotice.style.cssText = "padding:8px 16px;margin:0;font-size:13px;color:#294a70";
+  formEl.before(exchangeNotice);
+  function exchangeCount() { return (conversation || []).filter(function(t) { return t.role === "user"; }).length; }
+  function exchangeLimitReached() { return exchangeCount() >= cfg.MAX_EXCHANGES; }
+  function updateExchangeUi() {
+    var remaining = Math.max(0, cfg.MAX_EXCHANGES - exchangeCount());
+    var japanese = (host.closest("[lang]")?.lang || document.documentElement.lang).startsWith("ja");
+    exchangeNotice.textContent = remaining === 0
+      ? (japanese ? "この会話の利用上限に達しました（最大" + cfg.MAX_EXCHANGES + "往復）。clearで新しい会話を始められます。" : "This conversation has reached its limit of " + cfg.MAX_EXCHANGES + " exchanges. Clear to start a new conversation.")
+      : (japanese ? "お試しチャット：残り" + remaining + "回（最大" + cfg.MAX_EXCHANGES + "往復）" : "Trial chat: " + remaining + " exchanges remaining (maximum " + cfg.MAX_EXCHANGES + ").");
+    updateAuthUi();
+  }
+
   function loginRequired() { return cfg.AUTH_REQUIRED && !host.bearerToken; }
   function hubHeaders() {
     var headers = { Accept: "application/json" };
@@ -179,8 +195,8 @@ function boot(cfg, host) {
     authNotice.hidden = !locked;
     inputContainer.hidden = locked;
     historyEl.hidden = locked;
-    inputEl.disabled = locked;
-    root.querySelector(".lmw-send").disabled = locked;
+    inputEl.disabled = locked || exchangeLimitReached() || !!currentAbort;
+    root.querySelector(".lmw-send").disabled = locked || exchangeLimitReached() || !!currentAbort;
     if (locked && currentAbort) currentAbort.abort();
   }
   host.__lmwAuthChanged = function() {
@@ -627,6 +643,7 @@ function boot(cfg, host) {
   	// Before anything asynchronous: if this page was navigated away from and
   	// back, the visitor should see their conversation immediately.
   	restoreConversation();
+    updateExchangeUi();
 
   	var wellKnownReady = (async function() {
   		var urls = WELL_KNOWN_URLS === null
@@ -1069,6 +1086,7 @@ function boot(cfg, host) {
   		conversationStore.clear();
   		historyEl.innerHTML = "";
   		renderWelcome();
+    updateExchangeUi();
   	});
 
   	// Enter submits, Shift+Enter inserts a newline — matches llm_meta_chat's
@@ -1084,15 +1102,19 @@ function boot(cfg, host) {
 
   	formEl.addEventListener("submit", async function(event) {
   		event.preventDefault();
-    if (loginRequired()) { updateAuthUi(); return; }
+    if (loginRequired() || exchangeLimitReached() || currentAbort) { updateExchangeUi(); return; }
   		var userText = inputEl.value.trim();
   		if (!userText) return;
+    var priorConversation = conversation.slice();
+    conversation.push({ role: "user", content: userText });
+    persistConversation();
   		inputEl.value = "";
   		appendTurn("user", userText, pendingTurnLabel);
   		pendingTurnLabel = null;
 
   		if (currentAbort) { try { currentAbort.abort(); } catch (e) { /* noop */ } }
   		currentAbort = new AbortController();
+    updateExchangeUi();
 
   		var assistantBody = appendTurn("assistant", "");
   		activeAssistantBody = assistantBody;
@@ -1111,7 +1133,7 @@ function boot(cfg, host) {
 
   			var resourceLines = await resourceLinesForThisTurn();
   			var messages = [{ role: "system", content: currentSystemPrompt(resourceLines) }]
-  				.concat(conversation.map(function(t) { return { role: t.role, content: t.content }; }))
+  				.concat(priorConversation.map(function(t) { return { role: t.role, content: t.content }; }))
   				.concat([{ role: "user", content: userText }]);
 
   			var result = await runChatLoop({
@@ -1165,7 +1187,6 @@ function boot(cfg, host) {
   					historyEl.scrollTop = historyEl.scrollHeight;
   				}
   			});
-  			conversation.push({ role: "user", content: userText });
   			conversation.push({
   				role:    "assistant",
   				content: result.content,
@@ -1219,6 +1240,7 @@ function boot(cfg, host) {
   			collapseThinkingBlock();
   			activeAssistantBody = null;
   			currentAbort = null;
+      updateExchangeUi();
   		}
   	});
 }

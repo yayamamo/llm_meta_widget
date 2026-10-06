@@ -2936,6 +2936,7 @@ function readConfig(el) {
     ACTIONS_GLOBAL: str("actions-global", DEFAULTS.ACTIONS_GLOBAL),
     REMOTE_TOOLS_SCHEMA_ID: str("remote-tools-schema-id", DEFAULTS.REMOTE_TOOLS_SCHEMA_ID),
     MAX_ROUNDS: int("max-rounds", DEFAULTS.MAX_ROUNDS),
+    MAX_EXCHANGES: /^\d+$/.test(raw("max-exchanges") || "") && Number.isSafeInteger(Number(raw("max-exchanges"))) && Number(raw("max-exchanges")) > 0 ? Number(raw("max-exchanges")) : 4,
     WELL_KNOWN_URLS: wellKnown === null ? null : wellKnown.trim() === "" ? [] : splitList(wellKnown),
     LLM_PROVIDER: str("llm-provider", DEFAULTS.LLM_PROVIDER),
     ENABLE_MODEL_PICKER: bool("enable-model-picker", true),
@@ -3693,6 +3694,25 @@ function boot(cfg, host) {
   var loginUrl = safeAuthUrl(cfg.AUTH_URL, LLM_BASE);
   if (loginUrl) authLink.href = loginUrl;
   else authLink.hidden = true;
+  var exchangeNotice = document.createElement("p");
+  exchangeNotice.className = "lmw-exchange-limit";
+  exchangeNotice.setAttribute("role", "status");
+  exchangeNotice.style.cssText = "padding:8px 16px;margin:0;font-size:13px;color:#294a70";
+  formEl.before(exchangeNotice);
+  function exchangeCount() {
+    return (conversation || []).filter(function(t) {
+      return t.role === "user";
+    }).length;
+  }
+  function exchangeLimitReached() {
+    return exchangeCount() >= cfg.MAX_EXCHANGES;
+  }
+  function updateExchangeUi() {
+    var remaining = Math.max(0, cfg.MAX_EXCHANGES - exchangeCount());
+    var japanese = (host.closest("[lang]")?.lang || document.documentElement.lang).startsWith("ja");
+    exchangeNotice.textContent = remaining === 0 ? japanese ? "\u3053\u306E\u4F1A\u8A71\u306E\u5229\u7528\u4E0A\u9650\u306B\u9054\u3057\u307E\u3057\u305F\uFF08\u6700\u5927" + cfg.MAX_EXCHANGES + "\u5F80\u5FA9\uFF09\u3002clear\u3067\u65B0\u3057\u3044\u4F1A\u8A71\u3092\u59CB\u3081\u3089\u308C\u307E\u3059\u3002" : "This conversation has reached its limit of " + cfg.MAX_EXCHANGES + " exchanges. Clear to start a new conversation." : japanese ? "\u304A\u8A66\u3057\u30C1\u30E3\u30C3\u30C8\uFF1A\u6B8B\u308A" + remaining + "\u56DE\uFF08\u6700\u5927" + cfg.MAX_EXCHANGES + "\u5F80\u5FA9\uFF09" : "Trial chat: " + remaining + " exchanges remaining (maximum " + cfg.MAX_EXCHANGES + ").";
+    updateAuthUi();
+  }
   function loginRequired() {
     return cfg.AUTH_REQUIRED && !host.bearerToken;
   }
@@ -3706,8 +3726,8 @@ function boot(cfg, host) {
     authNotice.hidden = !locked;
     inputContainer.hidden = locked;
     historyEl.hidden = locked;
-    inputEl.disabled = locked;
-    root.querySelector(".lmw-send").disabled = locked;
+    inputEl.disabled = locked || exchangeLimitReached() || !!currentAbort;
+    root.querySelector(".lmw-send").disabled = locked || exchangeLimitReached() || !!currentAbort;
     if (locked && currentAbort) currentAbort.abort();
   }
   host.__lmwAuthChanged = function() {
@@ -4067,6 +4087,7 @@ function boot(cfg, host) {
   var resourcePlan = null;
   var RESOURCE_BUDGET_BYTES = 8e3;
   restoreConversation();
+  updateExchangeUi();
   var wellKnownReady = (async function() {
     var urls = WELL_KNOWN_URLS === null ? [window.location.origin + "/.well-known/mcp.json"] : WELL_KNOWN_URLS;
     for (var i = 0; i < urls.length; i++) {
@@ -4408,6 +4429,7 @@ function boot(cfg, host) {
     conversationStore.clear();
     historyEl.innerHTML = "";
     renderWelcome();
+    updateExchangeUi();
   });
   inputEl.addEventListener("keydown", function(e) {
     if (e.key === "Enter" && !e.shiftKey && !e.isComposing) {
@@ -4418,12 +4440,15 @@ function boot(cfg, host) {
   });
   formEl.addEventListener("submit", async function(event) {
     event.preventDefault();
-    if (loginRequired()) {
-      updateAuthUi();
+    if (loginRequired() || exchangeLimitReached() || currentAbort) {
+      updateExchangeUi();
       return;
     }
     var userText = inputEl.value.trim();
     if (!userText) return;
+    var priorConversation = conversation.slice();
+    conversation.push({ role: "user", content: userText });
+    persistConversation();
     inputEl.value = "";
     appendTurn("user", userText, pendingTurnLabel);
     pendingTurnLabel = null;
@@ -4434,6 +4459,7 @@ function boot(cfg, host) {
       }
     }
     currentAbort = new AbortController();
+    updateExchangeUi();
     var assistantBody = appendTurn("assistant", "");
     activeAssistantBody = assistantBody;
     liveChips = null;
@@ -4444,7 +4470,7 @@ function boot(cfg, host) {
     try {
       await wellKnownReady;
       var resourceLines = await resourceLinesForThisTurn();
-      var messages = [{ role: "system", content: currentSystemPrompt(resourceLines) }].concat(conversation.map(function(t) {
+      var messages = [{ role: "system", content: currentSystemPrompt(resourceLines) }].concat(priorConversation.map(function(t) {
         return { role: t.role, content: t.content };
       })).concat([{ role: "user", content: userText }]);
       var result = await runChatLoop({
@@ -4493,7 +4519,6 @@ function boot(cfg, host) {
           historyEl.scrollTop = historyEl.scrollHeight;
         }
       });
-      conversation.push({ role: "user", content: userText });
       conversation.push({
         role: "assistant",
         content: result.content,
@@ -4535,6 +4560,7 @@ function boot(cfg, host) {
       collapseThinkingBlock();
       activeAssistantBody = null;
       currentAbort = null;
+      updateExchangeUi();
     }
   });
 }

@@ -67,6 +67,7 @@ export function readConfig(el) {
     ACTIONS_GLOBAL:         str("actions-global", DEFAULTS.ACTIONS_GLOBAL),
     REMOTE_TOOLS_SCHEMA_ID: str("remote-tools-schema-id", DEFAULTS.REMOTE_TOOLS_SCHEMA_ID),
     MAX_ROUNDS:             int("max-rounds", DEFAULTS.MAX_ROUNDS),
+    MAX_EXCHANGES:          /^\d+$/.test(raw("max-exchanges") || "") && Number.isSafeInteger(Number(raw("max-exchanges"))) && Number(raw("max-exchanges")) > 0 ? Number(raw("max-exchanges")) : 4,
     WELL_KNOWN_URLS:        wellKnown === null
                               ? null
                               : (wellKnown.trim() === "" ? [] : splitList(wellKnown)),

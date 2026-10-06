@@ -134,7 +134,7 @@ test("returns exactly the configuration keys the panel logic reads", () => {
   assert.deepEqual(Object.keys(readConfig(el(MINIMAL))).sort(), [
     "ACTIONS_GLOBAL", "ACTIONS_SCHEMA_ID", "API_KEY_UUID", "AUTH_MESSAGE", "AUTH_REQUIRED", "AUTH_URL", "DEFAULT_HUB_TOOLS", "ENABLE_MODEL_PICKER",
     "ENABLE_TOOL_PICKER", "GREETING", "HUB_TOOLS_ALLOWLIST", "LLM_BASE",
-    "LLM_PROVIDER", "MAX_ROUNDS", "MODEL", "MODEL_ALLOWLIST",
+    "LLM_PROVIDER", "MAX_EXCHANGES", "MAX_ROUNDS", "MODEL", "MODEL_ALLOWLIST",
     "REMOTE_TOOLS_SCHEMA_ID", "STATE_GLOBAL", "TOOL_HUB_BASE", "WELL_KNOWN_URLS",
   ])
 })
@@ -155,4 +155,11 @@ test('login gate is opt-in and accepts configurable guidance', () => {
   assert.equal(c.AUTH_URL, 'https://hub.example/')
   assert.equal(c.AUTH_MESSAGE, 'ログインしてください。')
   assert.equal(readConfig(el({...MINIMAL, 'auth-required': 'false'})).AUTH_REQUIRED, false)
+})
+
+test("exchange limit accepts positive integers and defaults invalid values to four", () => {
+  for (const value of [undefined, "", "0", "-1", "2.5", "2x"]) {
+    assert.equal(readConfig(el({ ...MINIMAL, ...(value === undefined ? {} : { "max-exchanges": value }) })).MAX_EXCHANGES, 4)
+  }
+  assert.equal(readConfig(el({ ...MINIMAL, "max-exchanges": "2" })).MAX_EXCHANGES, 2)
 })
