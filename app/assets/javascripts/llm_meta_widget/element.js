@@ -18,7 +18,7 @@
 // The host page's contract is unchanged — `window.aiState`, `window.aiActions`
 // and the `#ai-actions` JSON block are still page-level globals, because they
 // belong to the host, not to this element.
-import { runChatLoop, fetchMcpManifest, listMcpPrompts, getMcpPrompt,
+import { runChatLoop, limitStopMessage, fetchMcpManifest, listMcpPrompts, getMcpPrompt,
          listMcpResources, readMcpResource, promptMessagesToText,
          loadHostResource, resourceLinesForTurn, resolvePromptArguments,
          promptButtonProps, promptArgumentSummary, fetchOllamaModels,
@@ -1620,16 +1620,17 @@ function boot(cfg, host) {
   			//   otherwise (e.g. max_rounds) — the loop hit a real hard cap
   			//     that likely truncated the response; user should know.
   			if (result.stopped_reason && result.stopped_reason !== "duplicate_tool_calls") {
-  				appendTurn("system",
-  					"The assistant reached its tool-use limit before finishing. " +
-  					"The reply above may be incomplete — try asking again or rephrasing.");
+        appendTurn("system", limitStopMessage({ code: "max_rounds" }, {
+          lang: host.closest("[lang]")?.lang || document.documentElement.lang || "en", rounds: MAX_ROUNDS
+        }));
   			}
   		} catch (err) {
       if (cfg.AUTH_REQUIRED && authenticationFailed(err)) host.bearerToken = null;
   			if (err.name === "AbortError" || /aborted/i.test(err.message || "")) {
   				appendTurn("system", "⏹ stopped");
   			} else {
-  				appendTurn("error", err.message);
+        var limitMessage = limitStopMessage(err, { lang: host.closest("[lang]")?.lang || document.documentElement.lang || "en" });
+        appendTurn(limitMessage ? "system" : "error", limitMessage || err.message);
   			}
   		} finally {
   			// Whatever happened — answered, aborted, threw, or returned

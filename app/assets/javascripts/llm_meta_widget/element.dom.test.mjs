@@ -1588,3 +1588,26 @@ test("trial submissions count once with live turn persistence", async () => {
   restored.querySelector(".lmw-clear").click()
   assert.equal(restored.querySelector("textarea").disabled, false)
 })
+
+for (const lang of ["ja","en"]) {
+  test(`a server-side limit displays retry guidance in ${lang} without retrying`, async () => {
+    streamScript=['event: error\ndata: {"code":"rate_limit","message":"quota exhausted"}\n\n']
+    const panel=await mount({lang})
+    panel.querySelector("textarea").value="question"
+    panel.querySelector("form").dispatchEvent(new window.Event("submit",{bubbles:true,cancelable:true}))
+    await tick(250)
+    assert.match(panel.textContent,lang==="ja" ? /未完了.*しばらく待ってから.*制限内で完了する場合/ : /incomplete.*Wait a while.*may.*finish within/)
+    assert.equal(sentBodies.length,1)
+  })
+}
+
+test("the round cap displays a possible retry rather than implying a complete answer", async () => {
+  hubServers=[{uuid:"s",name:"TogoMCP",tools:[{id:1,name:"guide"}]}]
+  streamScript=['event: tool_call\ndata: {"tool_call":{"id":"c1","name":"guide","arguments":{}}}\n\nevent: done\ndata: {"content":"Calling guide","finish_reason":"tool_calls"}\n\n']
+  const panel=await mount({lang:"ja","tool-hub-url":HUB,"default-hub-tools":"TogoMCP","max-rounds":"1"})
+  panel.querySelector("textarea").value="guide"
+  panel.querySelector("form").dispatchEvent(new window.Event("submit",{bubbles:true,cancelable:true}))
+  await tick(250)
+  assert.match(panel.textContent,/上限（1回）.*未完了.*改めて実行.*制限内で完了する場合/)
+  assert.equal(sentBodies.length,1)
+})

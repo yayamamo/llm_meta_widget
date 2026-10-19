@@ -39,6 +39,59 @@
 //   // result: { content, finishReason, toolCalls }
 //
 // Rejects if the server emits an `error` SSE event, or on network / abort.
+// Preserve structured admission metadata so the UI can explain limits and the
+// loop can stop instead of asking the model to retry a rejected tool call.
+function httpCallError(what, response, text) {
+  const error = new Error(`${what}: HTTP ${response.status} ${response.statusText || ""}${text ? " — " + text.slice(0, 200) : ""}`)
+  error.status = response.status
+  error.retryAfter = response.headers?.get?.("Retry-After") || null
+  try {
+    const body = JSON.parse(text)
+    error.code = typeof body.error === "string" ? body.error : body.error?.code || body.code
+    if (response.status === 502 && /MCP response exceeds \d+ bytes/.test(body.message || "")) error.code = "result_too_large"
+  } catch { /* HTML or plain-text upstream error */ }
+  return error
+}
+
+const RESOURCE_LIMIT_CODES = new Set([
+  "max_rounds", "rate_limit", "concurrency", "capacity", "tool_busy", "tool_rate_limit",
+  "daily_budget", "global_daily_budget", "stopped", "execution_timeout", "timeout",
+  "result_too_large", "payload_too_large", "context_length_exceeded"
+])
+export function isResourceLimit(error) {
+  return RESOURCE_LIMIT_CODES.has(error?.code) || [413, 429, 503, 504].includes(error?.status)
+}
+
+export function limitStopMessage(error, { lang = "en", rounds } = {}) {
+  if (!isResourceLimit(error)) return null
+  const ja = lang.toLowerCase().startsWith("ja")
+  const code = error?.code
+  const daily = code === "daily_budget" || code === "global_daily_budget"
+  const stopped = code === "stopped"
+  const size = ["result_too_large", "payload_too_large", "context_length_exceeded"].includes(code) || error?.status === 413
+  const timeout = ["execution_timeout", "timeout"].includes(code) || error?.status === 504
+  const roundLimit = code === "max_rounds"
+  const rawRetry = error?.retryAfter
+  const retrySeconds = /^\d+$/.test(rawRetry || "") ? Number(rawRetry) : Math.ceil((Date.parse(rawRetry) - Date.now()) / 1000)
+  const wait = Number.isFinite(retrySeconds) && retrySeconds > 0 ? retrySeconds : null
+  if (ja) {
+    const reason = roundLimit ? "ツール利用の処理回数の上限" + (rounds ? "（" + rounds + "回）" : "") :
+      size ? "入力またはツール結果のサイズ上限" : timeout ? "応答時間の上限" :
+      daily ? "サービスの利用量の上限" : stopped ? "サービス側の停止措置" : "混雑またはサービス側の利用制限"
+    const next = daily ? "利用上限が解除・リセットされてから、" : stopped ? "サービスが再開してから、" :
+      !roundLimit && !size && !timeout ? (wait ? "少なくとも" + wait + "秒待ってから、" : "しばらく待ってから、") : ""
+    return reason + "により処理を停止しました。ここまでの回答は未完了の可能性があります。" + next +
+      "対象や条件を絞ってやり直してください。改めて実行すると、処理の進み方によっては制限内で完了する場合があります。"
+  }
+  const reason = roundLimit ? "the tool-use round limit" + (rounds ? " (" + rounds + ")" : "") :
+    size ? "an input or tool-result size limit" : timeout ? "a response time limit" :
+    daily ? "the service usage budget" : stopped ? "a service-side stop" : "service capacity or a usage limit"
+  const next = daily ? "After the budget is reset or restored, " : stopped ? "Once the service resumes, " :
+    !roundLimit && !size && !timeout ? (wait ? "Wait at least " + wait + " seconds, then " : "Wait a while, then ") : ""
+  return "Processing stopped because of " + reason + ". The reply so far may be incomplete. " + next +
+    (next ? "try" : "Try") + " again with a narrower question. A new attempt may follow a different path and finish within the limits."
+}
+
 export async function singleLlmCall({
   baseUrl,
   apiKeyUuid,
@@ -87,7 +140,7 @@ export async function singleLlmCall({
     // the SSE stream ever starts. Surface the status so callers can distinguish
     // "endpoint not there" from "stream ran but errored mid-flight".
     const text = await response.text().catch(() => "")
-    throw new Error(`singleLlmCall: HTTP ${response.status} ${response.statusText}${text ? " — " + text.slice(0, 200) : ""}`)
+    throw httpCallError("singleLlmCall", response, text)
   }
   if (!response.body) {
     throw new Error("singleLlmCall: response has no body (streaming unsupported?)")
@@ -529,6 +582,7 @@ export async function runChatLoop(opts) {
       } catch (error) {
         allDispatched.push({ toolCall: tc, error })
         onToolDispatched?.({ toolCall: tc, error })
+        if (isResourceLimit(error)) throw error
         roundTripResults.push({ tc, result: { error: String(error.message || error) } })
       }
     }
@@ -551,6 +605,7 @@ export async function runChatLoop(opts) {
       } catch (error) {
         allDispatched.push({ toolCall: tc, error })
         onToolDispatched?.({ toolCall: tc, error })
+        if (isResourceLimit(error)) throw error
         // Feed the error text back to the LLM as the tool result — better
         // than dropping it (the LLM can react, apologize, retry differently).
         roundTripResults.push({ tc, result: { error: String(error.message || error) } })
@@ -693,7 +748,7 @@ export async function mcpRpc({ endpoint, method, params, signal, label }) {
   })
   if (!response.ok) {
     const text = await response.text().catch(() => "")
-    throw new Error(`${what}: HTTP ${response.status}${text ? " — " + text.slice(0, 200) : ""}`)
+    throw httpCallError(what, response, text)
   }
 
   const contentType = response.headers.get("content-type") || ""
@@ -822,7 +877,7 @@ export async function dispatchRemoteToolCall({ baseUrl, bearerToken, toolId, arg
   })
   if (!response.ok) {
     const text = await response.text().catch(() => "")
-    throw new Error(`dispatchRemoteToolCall: HTTP ${response.status} ${response.statusText}${text ? " — " + text.slice(0, 200) : ""}`)
+    throw httpCallError("dispatchRemoteToolCall", response, text)
   }
   const body = await response.json()
   return body.result

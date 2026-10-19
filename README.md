@@ -846,3 +846,10 @@ launcher accessible title. The top-left ⤢ handle resizes the panel by dragging
 when focused, arrow keys adjust its width/height in 32px steps. Size is saved
 locally and restored on reopening. `max-exchanges="4"` and `max-rounds="10"`
 remain independent conversation and internal-turn limits.
+
+Resource-limit stops show localized guidance based on the host/page `lang`:
+replies may be incomplete, and a new attempt with a narrower question may finish
+within the limits. Rate/capacity limits honor Retry-After where available; daily
+budgets and operator stops advise waiting for reset/resumption. Resource-limit
+MCP rejections stop orchestration instead of being fed back for automatic retry;
+ordinary recoverable tool errors still reach the model for query correction.
