@@ -132,10 +132,10 @@ test("returns exactly the configuration keys the panel logic reads", () => {
   // names. A key going missing here would surface as an undefined deep inside
   // the panel rather than as a clear error.
   assert.deepEqual(Object.keys(readConfig(el(MINIMAL))).sort(), [
-    "ACTIONS_GLOBAL", "ACTIONS_SCHEMA_ID", "API_KEY_UUID", "AUTH_MESSAGE", "AUTH_REQUIRED", "AUTH_URL", "DEFAULT_HUB_TOOLS", "ENABLE_MODEL_PICKER",
+    "ACTIONS_GLOBAL", "ACTIONS_SCHEMA_ID", "API_KEY_UUID", "AUTH_MESSAGE", "AUTH_REQUIRED", "AUTH_URL", "CHAT_TITLE", "DEFAULT_HUB_TOOLS", "ENABLE_MODEL_PICKER",
     "ENABLE_TOOL_PICKER", "GREETING", "HUB_TOOLS_ALLOWLIST", "LLM_BASE",
     "LLM_PROVIDER", "MAX_EXCHANGES", "MAX_ROUNDS", "MODEL", "MODEL_ALLOWLIST",
-    "REMOTE_TOOLS_SCHEMA_ID", "STATE_GLOBAL", "TOOL_HUB_BASE", "WELL_KNOWN_URLS",
+    "PAGE_CARD_ID", "PROMPTS_GLOBAL", "REMOTE_TOOLS_SCHEMA_ID", "RESOURCES_GLOBAL", "STATE_GLOBAL", "TOOL_HUB_BASE", "WELL_KNOWN_URLS",
   ])
 })
 
@@ -162,4 +162,9 @@ test("exchange limit accepts positive integers and defaults invalid values to fo
     assert.equal(readConfig(el({ ...MINIMAL, ...(value === undefined ? {} : { "max-exchanges": value }) })).MAX_EXCHANGES, 4)
   }
   assert.equal(readConfig(el({ ...MINIMAL, "max-exchanges": "2" })).MAX_EXCHANGES, 2)
+})
+
+test("reads a custom chat title without changing other widgets", () => {
+  assert.equal(readConfig(el(MINIMAL)).CHAT_TITLE, "AI assistant")
+  assert.equal(readConfig(el({ ...MINIMAL, "chat-title": "TogoMCP Trial" })).CHAT_TITLE, "TogoMCP Trial")
 })

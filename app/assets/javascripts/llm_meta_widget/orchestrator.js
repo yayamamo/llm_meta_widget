@@ -325,6 +325,18 @@ export async function runChatLoop(opts) {
     remoteTools = [],
     hostWideTools = [],
     maxRounds = 10,
+    // The model's own context window, from /api/llms. Without it the loop
+    // cannot know how much room is left, so it budgets nothing and a long
+    // tool-heavy turn is refused by the provider instead of degrading.
+    contextWindow = null,
+    // Tokens held back for the answer: a request that fills the window leaves
+    // nothing to generate into.
+    outputReserve = 2048,
+    // Called when a tool result is dropped to make room, so the panel can say
+    // so rather than the context quietly thinning.
+    onContextEvicted,
+    // Called when one oversized result is shortened, so the panel can say so.
+    onContextTruncated,
     // "hub" (default) talks to llm_meta_server; "ollama" talks straight to an
     // Ollama, with no server component of ours in between. The loop is the
     // same either way — only the call is swapped.
@@ -347,7 +359,7 @@ export async function runChatLoop(opts) {
     ...singleOpts
   } = opts
 
-  const messages     = [ ...(singleOpts.messages || []) ]
+  let messages       = [ ...(singleOpts.messages || []) ]
   const remoteByName = Object.fromEntries((remoteTools || []).map((t) => [ t.name, t ]))
   // Class 2: host-wide MCP tools (well-known). Map name→{endpoint, ...} for
   // dispatch. If the same name appears in aiActions, Class 3 wins there
@@ -366,6 +378,11 @@ export async function runChatLoop(opts) {
   const mergedLocalTools = Object.values(inlineByName)
 
   const rounds = []
+  const evicted = []
+  const truncatedResults = []
+  // Fixed for the turn: the declared tool set does not change between rounds.
+  const toolsTokens = estimateToolsTokens([].concat(
+  	singleOpts.localTools || [], remoteTools || [], hostWideTools || []))
   const allDispatched = []
   const allSkipped = []
   let lastResult = null
@@ -408,6 +425,28 @@ export async function runChatLoop(opts) {
     onRoundStart?.(round)
 
     // The loop is the same whoever answers; only the call differs.
+    // One oversized result is capped first: it frees hundreds of times more
+    // than dropping old results, and keeps what the model asked for.
+    const capped = truncateOversizedToolResults({
+    	messages, window: contextWindow, truncated: truncatedResults
+    });
+    if (capped.messages !== messages) {
+    	messages = capped.messages;
+    	onContextTruncated?.(truncatedResults.slice());
+    }
+
+    // Make room before sending, rather than after being refused. Only old
+    // tool results are given up; see evictOldToolResults.
+    const room = evictOldToolResults({
+    	messages, window: contextWindow, dropped: evicted,
+    	// The tools take their share of the window before any message does.
+    	reserve: outputReserve + toolsTokens
+    });
+    if (room.messages !== messages) {
+    	messages = room.messages;
+    	onContextEvicted?.({ dropped: evicted.slice(), needed: room.needed, window: room.window });
+    }
+
     const call = provider === "ollama" ? ollamaChatCall : singleLlmCall
     const turnResult = await call({
       ...singleOpts,
@@ -730,6 +769,28 @@ export async function readMcpResource({ endpoint, uri, signal }) {
 // The spec allows `content` to be an object or an array of content blocks;
 // anything non-text is dropped, which is worth knowing — a prompt carrying an
 // image would silently lose it on this path.
+// A prompt the PAGE declared, resolved against its handler map. This is
+// prompts/get for a surface with no transport: the card carries the metadata
+// (name, description, arguments — what prompts/list returns) and the handler
+// returns the filled messages, exactly as a server's prompts/get would.
+//
+// Keyed by `name` because that is what prompts/get takes. Accepts a plain
+// string as well as a messages array: a page prompt is usually one block of
+// text, and making every host write the envelope by hand would be a tax with
+// no benefit — promptMessagesToText flattens both to the same thing.
+export async function getPagePrompt({ name, args, prompts }) {
+  const handler = prompts && prompts[name]
+  if (typeof handler !== "function") {
+    throw new Error('the page declares prompt "' + name + '" but no handler answers to that name')
+  }
+
+  const result = await handler(args || {})
+  if (typeof result === "string") {
+    return { messages: [ { role: "user", content: { type: "text", text: result } } ] }
+  }
+  return result || { messages: [] }
+}
+
 export function promptMessagesToText(result) {
   return (result?.messages || [])
     .map((m) => {
@@ -819,8 +880,13 @@ function parseSseFrame(raw) {
 // follow-on). Three optional fields a server may declare on a resources/list
 // entry:
 //
-//   sizeBytes  - byte length of the payload resources/read would return, so a
+//   size       - byte count of the payload resources/read would return, so a
 //                client can decide whether to attach it BEFORE fetching it.
+//                This is the BASE Resource field, not an extension field: the
+//                extension only strengthens it to "MUST be exact when present".
+//                Read from `_meta.sizeBytes` too, which is where the earlier
+//                draft put it — servers deployed against that draft (PD among
+//                them) are still emitting it.
 //   volatility - "stable" (content fixed) or "volatile" (varies between
 //                turns, so a client re-reads it each turn).
 //   autoAttach - may a client attach this without the user asking for it?
@@ -835,29 +901,405 @@ function parseSseFrame(raw) {
 // the first turn only.
 export const STATIC_PRIMITIVES_META = "io.modelcontextprotocol/static-primitives"
 
+// ---- page card --------------------------------------------------------
+//
+// The same `io.modelcontextprotocol/static-primitives` envelope a server puts
+// in its Server Card, delivered in the DOCUMENT instead: one <script> of JSON
+// declaring the page's own tools, prompts and resources. SEP-2575 already says
+// the Server Card and server/discover are two deliveries of one content; a page
+// is a third, with no transport at all.
+//
+// Parsing only. What a declaration MEANS is resolved elsewhere: tool handlers
+// live in window.aiActions keyed by `name`, and reads will be keyed by the
+// protocol's own identifier — `name` for prompts, `uri` for resources, because
+// that is what prompts/get and resources/read take.
+//
+// Malformed input must never take the page down: a card is host-authored and a
+// typo in it should cost that one entry, not the assistant. Everything
+// unparseable returns empty arrays and says so on the console, which is how
+// aiState already treats a reader missing its description.
+// The media type that locates a card inside an HTML document. It is the
+// locator, so it is NOT configurable: a client that has to be told where to
+// look cannot discover anything. SEP-0000, "HTML-delivery mode".
+export const PAGE_CARD_MEDIA_TYPE = "application/mcp-static-primitives+json"
+
+// The transport an HTML-delivered Server Card declares: a JavaScript global
+// under which the handler maps live. A Server Card always states its endpoint
+// rather than relying on a convention, and a page card states its global the
+// same way — so a consumer that has never heard of this widget can parse the
+// card, find the handlers and dispatch. The three legacy globals
+// (aiActions/aiPrompts/aiResources) are names only this widget knows, and are
+// configurable per page, so nothing outside could rely on them.
+// How much room a model has, read from /api/llms — the one call the widget
+// already makes before a turn. Scans every family, because the picker shows
+// only the local ones while the configured model is often hosted, and the two
+// families use different shapes for the same thing (`value` vs `name`).
+//
+// Returns null when the hub does not say. Null means "no budget to work with",
+// which is not the same as zero, and every caller below treats it as "do not
+// guess" rather than "no room".
+// How many bytes of reference resources a turn may attach, derived from the
+// model's window instead of guessed. The old fixed 8000 was chosen as "~2k
+// tokens, beyond which a resource crowds out the conversation on a 32k local
+// model" — which is 6.25% of that window, so the same share reproduces 8000 at
+// 32k exactly and gives a 128k model the 32 KB it can afford.
+//
+// The floor keeps the previous behaviour whenever the window is unknown. The
+// cap is there because these bytes are fetched and inlined on every turn: the
+// largest real catalog (PubDictionaries, 218 dictionaries) is ~35 KB, so 64 KB
+// is already generous and a 1M-token model does not need 250 KB of it.
+export const RESOURCE_SHARE_OF_WINDOW = 0.0625
+
+// Bytes per token for SIZING that budget — not the estimator above, which
+// measures real text. Kept at four so the budget stays exactly what it was
+// (8 KB on a 32k model): how many tokens those bytes become depends on the
+// resource, and re-sizing budgets is not this constant's job.
+export const RESOURCE_BYTES_PER_TOKEN = 4
+
+export function resourceBudgetBytes(window, { floor = 8000, cap = 64_000 } = {}) {
+  if (!window || !Number.isFinite(window)) return floor
+  const share = Math.round(window * RESOURCE_SHARE_OF_WINDOW * RESOURCE_BYTES_PER_TOKEN)
+  return Math.min(cap, Math.max(floor, share))
+}
+
+// A rough token count, the same three classes the hub's estimator uses.
+//
+// One ratio cannot describe both prose and a tool result. Letters and spaces
+// tokenize at roughly 3.5 characters each; digits, punctuation and symbols go
+// much denser, and a JSON tool result is mostly those.
+//
+// Measured against a real refusal (2026-10-17): a 289,101-character request
+// the provider counted as 135,291 tokens was 33% letters, 16% digits and 45%
+// punctuation. At a flat four characters per token that is 72,275 — 53% of the
+// truth — so nothing was evicted and the provider refused the turn instead.
+// These classes put it at 106%: high, which is the safe direction here, since
+// underestimating means the turn dies while overestimating only gives up an
+// old tool result slightly early.
+export const PROSE_CHARS_PER_TOKEN = 3.5
+export const DENSE_CHARS_PER_TOKEN = 1.6
+export const CJK_CHARS_PER_TOKEN = 1
+export const MESSAGE_OVERHEAD_TOKENS = 4
+
+const CJK_PATTERN = /[\u3000-\u30ff\u3400-\u4dbf\u4e00-\u9fff\uac00-\ud7af\uf900-\ufaff\uff00-\uffef]/g
+const PROSE_PATTERN = /[A-Za-z \n\t]/g
+
+export function estimateTextTokens(text) {
+  const str = typeof text === "string" ? text : String(text ?? "")
+  const cjk = (str.match(CJK_PATTERN) || []).length
+  const prose = (str.match(PROSE_PATTERN) || []).length
+  const dense = str.length - cjk - prose
+  return Math.ceil(cjk / CJK_CHARS_PER_TOKEN +
+                   prose / PROSE_CHARS_PER_TOKEN +
+                   dense / DENSE_CHARS_PER_TOKEN)
+}
+
+export function estimateTokens(messages) {
+  return (messages || []).reduce((sum, m) => {
+    const content = typeof m?.content === "string" ? m.content : JSON.stringify(m?.content ?? "")
+    return sum + estimateTextTokens(content) + MESSAGE_OVERHEAD_TOKENS
+  }, 0)
+}
+
+// What the declared tools cost in the window. They are part of every request:
+// names, descriptions and JSON schemas. On the hub path the browser sends only
+// `tool_ids` and the hub expands the schemas, but the browser listed those
+// tools to build its picker, so it still has what it needs to price them.
+//
+// This is not a detail. TogoMCP declares around twenty tools, which is a few
+// thousand tokens standing in the window before the conversation starts; a
+// budget counting only messages runs low and evicts too late to help.
+export function estimateToolsTokens(tools) {
+  const text = (tools || []).map((t) => JSON.stringify({
+    name: t?.name, description: t?.description, schema: t?.input_schema || t?.inputSchema
+  })).join("")
+  // Counted with the same classes: a schema is JSON, which is the dense case.
+  return estimateTextTokens(text)
+}
+
+// A single tool result may use at most this share of the window.
+//
+// Measured over 179 real tool results (2026-10-17): the median is 2.1% of the
+// window and the 90th percentile 20%, but one `togovar_search_variant` result
+// came to 94% — 120,667 tokens — and alone could not coexist with a
+// conversation. All six over-budget requests in that sample were caused by one
+// oversized result, so capping it clears every one of them while touching only
+// 4.5% of results at all.
+//
+// 40% keeps a useful prefix of even the worst result (42% of it) and still
+// leaves most of the window for the conversation, the schemas and the answer.
+export const MAX_TOOL_RESULT_SHARE = 0.4
+
+// Shortens any single tool result that exceeds that share.
+//
+// This runs BEFORE eviction, because it is strictly the better move: on the
+// audited turn it frees ~69,000 tokens from one result, where dropping the
+// oldest results freed 160 and lost two results the model had asked for. The
+// model is told what happened, in the result itself, so it can narrow its
+// query instead of assuming it received everything.
+export function truncateOversizedToolResults({ messages, window,
+                                               share = MAX_TOOL_RESULT_SHARE,
+                                               truncated = [] } = {}) {
+  if (!window || !Number.isFinite(window)) return { messages, truncated }
+
+  const cap = Math.floor(window * share)
+  let out = null
+
+  ;(messages || []).forEach((m, i) => {
+    if (m?.role !== "tool" || typeof m.content !== "string") return
+    const tokens = estimateTextTokens(m.content)
+    if (tokens <= cap) return
+
+    // Scale the cut by the measured ratio rather than a fixed chars-per-token,
+    // so a dense result is cut by what it actually costs.
+    const keep = Math.max(1, Math.floor(m.content.length * cap / tokens))
+    out = out || messages.slice()
+    truncated.push({ name: m.name, fromTokens: tokens, toTokens: cap })
+    out[i] = Object.assign({}, m, {
+      content: m.content.slice(0, keep) +
+        "\n\n[truncated: " + keep + " of " + m.content.length + " characters shown. " +
+        "One tool result may use at most " + Math.round(share * 100) +
+        "% of the context window. Call the tool again with a narrower query to see more.]"
+    })
+  })
+
+  return { messages: out || messages, truncated }
+}
+
+// Makes room for the next round by dropping the OLDEST tool results, which is
+// the one eviction a chat loop can justify: the model has already read them and
+// said what it made of them in the assistant turn that follows, so its own
+// summary survives. Nothing else is touched — not the system prompt, not the
+// questions, not the assistant's words.
+//
+// Each dropped result leaves a marker in its place, because a tool message must
+// still answer its tool_call_id: a provider that sees a call with no result
+// rejects the request, and a model that sees no mention of the result would
+// happily call the same tool again.
+//
+// Returns the messages unchanged when the window is unknown. Guessing a window
+// would be worse than not budgeting: too low throws away context the turn
+// needed, and too high fails at the provider anyway.
+export function evictOldToolResults({ messages, window, reserve = 0, dropped = [] }) {
+  if (!window || !Number.isFinite(window)) return { messages, dropped }
+
+  const budget = window - reserve
+  // What the whole turn would have needed, against what the model holds. The
+  // panel shows both, because "an old result was dropped" on its own tells a
+  // reader nothing about whether to retry, shorten the question, or change
+  // model.
+  const needed = estimateTokens(messages) + reserve
+  if (estimateTokens(messages) <= budget) return { messages, dropped, needed, window }
+
+  const out = messages.slice()
+  for (let i = 0; i < out.length; i++) {
+    if (estimateTokens(out) <= budget) break
+    const m = out[i]
+    if (m?.role !== "tool") continue
+    if (typeof m.content === "string" && m.content.startsWith("[dropped")) continue
+
+    dropped.push({ name: m.name, tokens: estimateTokens([ m ]) })
+    out[i] = Object.assign({}, m, {
+      content: "[dropped to make room in the context window. Call the tool again " +
+               "if you still need it, with a narrower query.]"
+    })
+  }
+  return { messages: out, dropped, needed, window }
+}
+
+export function modelWindowFrom(payload, modelId) {
+  for (const family of (payload && payload.llms) || []) {
+    const entries = [].concat(family.available_models || [], family.models || [])
+    for (const entry of entries) {
+      if (!entry) continue
+      const id = entry.value || entry.name
+      if (id !== modelId) continue
+      const window = Number(entry.max_input_tokens)
+      return Number.isFinite(window) && window > 0 ? window : null
+    }
+  }
+  return null
+}
+
+export const PAGE_GLOBAL_TRANSPORT = "page-global"
+
+export function declaredPageGlobal(card) {
+  for (const remote of (card && card.remotes) || []) {
+    if (!remote || remote.type !== PAGE_GLOBAL_TRANSPORT) continue
+    if (typeof remote.global === "string" && remote.global.trim() !== "") return remote.global.trim()
+  }
+  return null
+}
+
+// Resolves the three handler maps. A declared global wins; each map falls back
+// to its legacy global independently, so a page part-way through moving over
+// keeps working instead of losing the primitives it has not moved yet.
+export function pageHandlers({ card, scope = {}, legacy = {}, warn = console.warn } = {}) {
+  const name = declaredPageGlobal(card)
+  const declared = name ? scope[name] : null
+
+  // A card that names a global the page never defines is almost always a load
+  // order problem, or a script that threw before it got there. Falling back in
+  // silence hides that: the page then behaves as if it had declared nothing,
+  // and the first symptom is a prompt or tool that "has no handler".
+  if (name && !declared) {
+    warn(`[llm-meta-widget] the page card declares global "${name}", but window.${name} ` +
+         "is not defined — is the script that defines it loaded, and did it run?")
+  }
+
+  const isMap = (v) => !!v && typeof v === "object" && !Array.isArray(v)
+  const pick = (kind, legacyName) => {
+    // `declared ? … : undefined`, not `declared && …`: the second yields null
+    // when nothing is declared, and `typeof null === "object"`, so the check
+    // below then warned about "window.null.tools" on every page with no card.
+    const fromGlobal = declared ? declared[kind] : undefined
+    if (isMap(fromGlobal)) return fromGlobal
+    // An array is the mistake worth naming: it passes a typeof check, so it
+    // would be used as a map and answer every lookup with undefined.
+    if (declared && fromGlobal !== undefined && !isMap(fromGlobal)) {
+      warn(`[llm-meta-widget] window.${name}.${kind} is ${Array.isArray(fromGlobal) ? "an array" : typeof fromGlobal}; ` +
+           `it must be an object keyed by ${kind === "resources" ? "uri" : "name"}`)
+    }
+    return (legacyName && scope[legacyName]) || {}
+  }
+  return {
+    global: name,
+    tools: pick("tools", legacy.tools),
+    prompts: pick("prompts", legacy.prompts),
+    resources: pick("resources", legacy.resources)
+  }
+}
+
+// Several blocks may appear in one document, so that a page assembled from
+// components can let each component declare its own primitives. The arrays
+// concatenate by primitive type.
+//
+// A duplicate identifier across blocks is an ERROR, not a precedence puzzle:
+// the spec says a client should report it and should not silently pick one. So
+// every copy of a duplicated identifier is dropped and the author is told.
+// Picking the first would make which component wins depend on DOM order, which
+// is not something a page author controls when the components are partials.
+export function mergeStaticPrimitivesCards(cards, warn = console.warn) {
+  const merged = { remotes: [], tools: [], prompts: [], resources: [] }
+  // Each block is a full Server Card and may declare a transport. The first
+  // one wins; a second block naming a DIFFERENT global is an authoring error,
+  // because only one of them can be dispatched to.
+  for (const card of cards || []) {
+    for (const remote of (card && card.remotes) || []) {
+      const clash = merged.remotes.find((r) => r.type === remote.type && r.global !== remote.global)
+      if (clash) {
+        warn(`[llm-meta-widget] two blocks declare different ${remote.type} globals ` +
+             `("${clash.global}" and "${remote.global}"); using "${clash.global}"`)
+        continue
+      }
+      if (!merged.remotes.some((r) => r.type === remote.type && r.global === remote.global)) {
+        merged.remotes.push(remote)
+      }
+    }
+  }
+  const keyOf = { tools: "name", prompts: "name", resources: "uri" }
+
+  for (const kind of [ "tools", "prompts", "resources" ]) {
+    const key = keyOf[kind]
+    const all = []
+    for (const card of cards || []) all.push(...((card && card[kind]) || []))
+
+    const counts = new Map()
+    for (const entry of all) counts.set(entry[key], (counts.get(entry[key]) || 0) + 1)
+
+    for (const [ id, n ] of counts) {
+      if (n > 1) {
+        warn(`[llm-meta-widget] the page declares ${kind} "${id}" ${n} times; ` +
+             "dropping every copy — remove the duplicate to say which one you mean")
+      }
+    }
+    merged[kind] = all.filter((entry) => counts.get(entry[key]) === 1)
+  }
+  return merged
+}
+
+export function readStaticPrimitivesCard(text, warn = console.warn) {
+  const empty = { remotes: [], tools: [], prompts: [], resources: [] }
+  if (typeof text !== "string" || text.trim() === "") return empty
+
+  let doc
+  try {
+    doc = JSON.parse(text)
+  } catch (e) {
+    warn("[llm-meta-widget] page card is not valid JSON; ignoring it:", e.message)
+    return empty
+  }
+
+  const ext = (doc && doc._meta && doc._meta[STATIC_PRIMITIVES_META]) || null
+  if (!ext) {
+    warn(`[llm-meta-widget] page card has no _meta["${STATIC_PRIMITIVES_META}"]; ignoring it`)
+    return empty
+  }
+
+  const named = (arr, kind) => (Array.isArray(arr) ? arr : []).filter((e) => {
+    const ok = e && typeof e.name === "string" && e.name.trim() !== ""
+    if (!ok) warn(`[llm-meta-widget] page card: dropping a ${kind} with no name`)
+    return ok
+  })
+
+  return {
+    // The whole card's transport, so what it declares survives the parse.
+    remotes: Array.isArray(doc.remotes) ? doc.remotes : [],
+    tools: named(ext.tools, "tool"),
+    prompts: named(ext.prompts, "prompt"),
+    // Resources are addressed by uri, not name — resources/read takes the uri.
+    resources: (Array.isArray(ext.resources) ? ext.resources : []).filter((e) => {
+      const ok = e && typeof e.uri === "string" && e.uri.trim() !== ""
+      if (!ok) warn("[llm-meta-widget] page card: dropping a resource with no uri")
+      return ok
+    })
+  }
+}
+
 const VOLATILITIES = [ "stable", "volatile" ]
+
+const usableSize = (n) => (typeof n === "number" && isFinite(n) ? n : null)
+const pickDeclared = (own, fromMeta) => (own === undefined ? fromMeta : own)
 
 export function resourceHints(entry) {
   const meta = (entry && entry._meta && entry._meta[STATIC_PRIMITIVES_META]) || {}
   return {
     // A non-numeric or absent size means "unknown", never 0 — 0 would read
     // as a free resource and sail through every budget check.
-    sizeBytes: typeof meta.sizeBytes === "number" && isFinite(meta.sizeBytes) ? meta.sizeBytes : null,
-    volatility: VOLATILITIES.indexOf(meta.volatility) === -1 ? "stable" : meta.volatility,
-    autoAttach: typeof meta.autoAttach === "boolean" ? meta.autoAttach : true
+    // Base `size` wins; `_meta.sizeBytes` is the earlier draft's spelling and
+    // is accepted so a new client keeps its budget gate against an old server.
+    size: usableSize(entry && entry.size) ?? usableSize(meta.sizeBytes),
+    // Deprecated alias, kept for one release so renaming the field is not a
+    // breaking change: orchestrator.js is a published entry point, so anything
+    // it returns is public API. Dropped at 0.9.0 together with the
+    // `_meta.sizeBytes` fallback above — one deprecation, one bump.
+    get sizeBytes() { return this.size },
+    // Same rule as `size`: the entry's own field wins, `_meta` is the fallback.
+    // SEP-0000 defines these ON the Resource object; a server puts them in
+    // `_meta` only because the extension is not merged yet. A PAGE card's
+    // entries already sit inside the extension block, so for them the fields
+    // are simply top-level — reading both is what lets one planner serve both.
+    volatility: VOLATILITIES.indexOf(pickDeclared(entry && entry.volatility, meta.volatility)) === -1
+      ? "stable"
+      : pickDeclared(entry && entry.volatility, meta.volatility),
+    autoAttach: typeof pickDeclared(entry && entry.autoAttach, meta.autoAttach) === "boolean"
+      ? pickDeclared(entry && entry.autoAttach, meta.autoAttach)
+      : true
   }
 }
 
 // The pre-flight decision, made from the resources/list entry alone.
 // `fetch: false` means the bytes never cross the wire at all.
 export function planResourceAttachment(entry, budgetBytes) {
-  const { sizeBytes, volatility, autoAttach } = resourceHints(entry)
-  const base = { sizeBytes, volatility, uri: entry && entry.uri }
+  const { size, volatility, autoAttach } = resourceHints(entry)
+  // `sizeBytes` is the deprecated alias again: this function is exported too,
+  // and it returned that name before the field was aligned with the base
+  // Resource interface. Dropped at 0.9.0 with the rest.
+  const base = { size, sizeBytes: size, volatility, uri: entry && entry.uri }
 
   if (!autoAttach) {
     return { ...base, fetch: false, autoAttach: false, reason: "not-auto-attach" }
   }
-  if (sizeBytes !== null && sizeBytes > budgetBytes) {
+  if (size !== null && size > budgetBytes) {
     // The client's budget overrides the server's willingness — which is why
     // autoAttach has to be a boolean here rather than a restatement of a hint.
     return { ...base, fetch: false, autoAttach: false, reason: "over-budget" }
@@ -868,7 +1310,7 @@ export function planResourceAttachment(entry, budgetBytes) {
     autoAttach: true,
     // Unknown size still gets fetched, then trimmed — the trim is the
     // safety net for servers that do not declare a size.
-    reason: sizeBytes === null ? "size-unknown" : "within-budget"
+    reason: size === null ? "size-unknown" : "within-budget"
   }
 }
 
@@ -899,6 +1341,65 @@ async function readResourceContext({ endpoint, uri, name, read, budgetBytes }) {
     return { uri, name: name || uri, text: trimResourceText(entry.text, budgetBytes) }
   } catch (e) {
     // Optional context — a failed read must never block the widget.
+    return null
+  }
+}
+
+// ---- page resources ----------------------------------------------------
+//
+// resources/read for a surface with no transport. The card lists them, a
+// handler map keyed by URI reads them — URI because that is what
+// resources/read takes, and because the spec defines it as the unique
+// identifier while `name` is only required, never unique.
+//
+// Unlike a server endpoint, a page declares SEVERAL: PubDictionaries has six
+// readers, each with its own description. So these are planned and rendered as
+// a list, not as the single reference resource loadHostResource assumes.
+export function planPageResources({ entries, budgetBytes, onSkip }) {
+  return (entries || []).map((entry) => {
+    const plan = planResourceAttachment(entry, budgetBytes)
+    plan.name = entry.name || entry.uri
+    plan.description = entry.description || ""
+    if (!plan.fetch && onSkip) onSkip(plan)
+    return plan
+  }).filter((plan) => plan.fetch)
+}
+
+// One compact line per resource — the same shape the page-state annex uses,
+// NOT the block form a hub resource gets. Six block-form resources would cost
+// three lines each and repeat a header the model does not need; how to render
+// attached context is the client's decision, which the spec leaves open.
+export function pageResourceLine(plan, text) {
+  return "- " + plan.name + (plan.description ? " (" + plan.description + ")" : "") + ": " + text
+}
+
+export async function pageResourceLinesForTurn({ plans, resources, budgetBytes, cache = {} }) {
+  const lines = []
+  for (const plan of plans || []) {
+    let text = plan.volatility === "volatile" ? null : cache[plan.uri]
+    if (text === null || text === undefined) {
+      text = await readPageResource({ uri: plan.uri, resources, budgetBytes })
+      if (plan.volatility !== "volatile" && text !== null) cache[plan.uri] = text
+    }
+    if (text !== null) lines.push(pageResourceLine(plan, text))
+  }
+  return { lines, cache }
+}
+
+async function readPageResource({ uri, resources, budgetBytes }) {
+  const handler = resources && resources[uri]
+  if (typeof handler !== "function") {
+    console.warn('[llm-meta-widget] the page declares resource "' + uri + '" but no handler answers to that uri')
+    return null
+  }
+  try {
+    const value = await handler()
+    const text = typeof value === "string" ? value : JSON.stringify(value)
+    return trimResourceText(text === undefined ? "" : text, budgetBytes)
+  } catch (e) {
+    // Optional context — one broken reader must not cost the turn, exactly as
+    // a failed hub read does not.
+    console.warn('[llm-meta-widget] reading "' + uri + '" failed:', e && e.message)
     return null
   }
 }
@@ -968,10 +1469,42 @@ export async function resourceLinesForTurn({ plan, cached, endpoint, read, budge
 // (window.aiState) by name. `dictionaries` is read from a
 // `selected_dictionaries` reader: the page selects a LIST, and the prompt
 // declares the CSV shape the text_annotation tool already takes.
+// Page resources are addressed `page:<name>`: a custom scheme because the
+// protocol asks for a URI and `https:` is reserved for what a client can fetch
+// itself, and with no path because a page has one namespace.
+const PAGE_URI_PREFIX = "page:"
+
 const PROMPT_ARG_ALIASES = { dictionaries: "selected_dictionaries" }
 
+// Prompt arguments are declared by plain name (`text`); page resources are
+// addressed by URI (`page:text`). So on a page that declares its state as
+// resources and keeps no `aiState`, the resolver below finds nothing under the
+// names it looks up and every argument arrives empty — the visitor is asked to
+// retype what is already on screen. This presents those resources in the shape
+// the resolver consumes, keyed by the name inside the URI.
+//
+// An explicit `aiState` entry wins: a page running both channels has said what
+// it wants under that name.
+export function promptArgState({ entries = [], resources = {}, state = {} } = {}) {
+  const merged = Object.assign({}, state)
+  for (const entry of entries) {
+    const uri = entry && entry.uri
+    if (!uri || uri.indexOf(PAGE_URI_PREFIX) !== 0) continue
+    const name = uri.slice(PAGE_URI_PREFIX.length)
+    const reader = resources[uri]
+    if (!name || merged[name] || typeof reader !== "function") continue
+    merged[name] = { description: entry.description || "", read: reader }
+  }
+  return merged
+}
+
 export function promptArgFromState(argName, state) {
-  const reader = (state && state[argName]) || (state && state[PROMPT_ARG_ALIASES[argName]])
+  // Same object shape the system-prompt annex consumes: { description, read }.
+  // The bare-function form was removed in 0.8.0, so an entry without `read` is
+  // simply not a reader — the prompt argument stays empty and the visitor fills
+  // it, which is the documented behaviour for state the page cannot supply.
+  const entry = (state && state[argName]) || (state && state[PROMPT_ARG_ALIASES[argName]])
+  const reader = entry && typeof entry.read === "function" ? entry.read : null
   if (typeof reader !== "function") return ""
   let value
   try {

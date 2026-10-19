@@ -22,7 +22,12 @@ import { runChatLoop, fetchMcpManifest, listMcpPrompts, getMcpPrompt,
          listMcpResources, readMcpResource, promptMessagesToText,
          loadHostResource, resourceLinesForTurn, resolvePromptArguments,
          promptButtonProps, promptArgumentSummary, fetchOllamaModels,
-         createConversationStore, conversationKeyFor } from "./orchestrator.js";
+         createConversationStore, conversationKeyFor,
+         readStaticPrimitivesCard, getPagePrompt,
+         planPageResources, pageResourceLinesForTurn,
+         promptArgState, mergeStaticPrimitivesCards,
+         PAGE_CARD_MEDIA_TYPE, pageHandlers,
+         modelWindowFrom, resourceBudgetBytes } from "./orchestrator.js";
 import { marked } from "./marked.esm.js";
 import { readConfig } from "./config.js";
 import { safeAuthUrl, authenticationFailed } from "./auth.js";
@@ -42,8 +47,12 @@ const MARKUP = `
 </button>
 
 <div id="llm-meta-widget-chat" class="llm-meta-conversation">
-	<div class="lmw-header">
-		<span class="lmw-title">AI assistant</span>
+	<button type="button" class="lmw-resize" aria-label="Resize chat window" title="Drag to resize; arrow keys adjust size">⤢</button>
+  <div class="lmw-header">
+		<span class="lmw-title-group">
+			<span class="lmw-title">AI assistant</span>
+			<span class="lmw-powered">(powered by <a href="https://chat.aibranch.org/" target="_blank" rel="noopener noreferrer">AIbranch</a>)</span>
+		</span>
 		<div class="lmw-header-right">
 			<button type="button" class="lmw-clear" title="Clear conversation">clear</button>
 			<button type="button" class="lmw-hide" title="Hide">−</button>
@@ -142,9 +151,12 @@ function boot(cfg, host) {
   var API_KEY_UUID           = cfg.API_KEY_UUID;
   var MODEL                  = cfg.MODEL;
   var ACTIONS_SCHEMA_ID      = cfg.ACTIONS_SCHEMA_ID;
+  var PAGE_CARD_ID           = cfg.PAGE_CARD_ID;
   var GREETING               = cfg.GREETING;
   var STATE_GLOBAL           = cfg.STATE_GLOBAL;
   var ACTIONS_GLOBAL         = cfg.ACTIONS_GLOBAL;
+  var PROMPTS_GLOBAL         = cfg.PROMPTS_GLOBAL;
+  var RESOURCES_GLOBAL       = cfg.RESOURCES_GLOBAL;
   var REMOTE_TOOLS_SCHEMA_ID = cfg.REMOTE_TOOLS_SCHEMA_ID;
   var MAX_ROUNDS             = cfg.MAX_ROUNDS;
   var WELL_KNOWN_URLS        = cfg.WELL_KNOWN_URLS;
@@ -157,6 +169,30 @@ function boot(cfg, host) {
   	var root         = document.getElementById("llm-meta-widget-chat");
   	var toggleBtn    = document.getElementById("llm-meta-widget-toggle");
   	var historyEl    = root.querySelector(".lmw-messages");
+
+  	// Following the output, or reading back through it?
+  	//
+  	// Every mid-turn pin used to be unconditional: a tool chip, a thinking
+  	// block, or any delta slammed the view back to the end. On a short answer
+  	// nobody notices. On a long tool turn the deltas keep coming for minutes,
+  	// and the reader cannot scroll anywhere by any means — wheel, trackpad,
+  	// keyboard — because each attempt is undone within milliseconds. Reported
+  	// from TogoMCP and reproduced on PubDictionaries (2026-10-16).
+  	//
+  	// The reader's own scrolling says which they are doing: leave the bottom
+  	// and we stop following; come back to it and we resume.
+  	var SCROLL_PIN_SLACK = 40;   // px from the end still counts as "at the end"
+
+  	// Rounded to the nearest thousand and grouped, so the numbers read as a
+  	// scale rather than as a precise count the estimate cannot support.
+  	function thousands(n) {
+  		return (Math.round(n / 1000) * 1000).toLocaleString("en-US");
+  	}
+
+  	function atBottom() {
+  		return historyEl.scrollHeight - historyEl.scrollTop - historyEl.clientHeight <= SCROLL_PIN_SLACK;
+  	}
+  	function pinToBottom() { historyEl.scrollTop = historyEl.scrollHeight; }
   	var formEl       = root.querySelector(".lmw-form");
   	var inputEl      = root.querySelector(".lmw-input");
   	var clearBtn     = root.querySelector(".lmw-clear");
@@ -190,6 +226,10 @@ function boot(cfg, host) {
     if (host.bearerToken) headers.Authorization = "Bearer " + host.bearerToken;
     return headers;
   }
+  root.querySelector(".lmw-title").textContent = cfg.CHAT_TITLE;
+  toggleBtn.setAttribute("aria-label", "Open " + cfg.CHAT_TITLE);
+  toggleBtn.setAttribute("title", "Open " + cfg.CHAT_TITLE);
+
   function updateAuthUi() {
     var locked = loginRequired();
     authNotice.hidden = !locked;
@@ -283,6 +323,45 @@ function boot(cfg, host) {
   		}
   	}
 
+  // Resize from the top-left while keeping the right/bottom edges fixed.
+  // This leaves room to grow even when the panel starts at the viewport edge.
+  var resizeHandle = root.querySelector(".lmw-resize");
+  var resizeStart = null;
+  function resizePanel(width, height, right, bottom) {
+    var maxWidth = Math.max(1, window.innerWidth - 32);
+    var maxHeight = Math.max(1, window.innerHeight - 32);
+    width = Math.min(maxWidth, Math.max(Math.min(336, maxWidth), width));
+    height = Math.min(maxHeight, Math.max(Math.min(240, maxHeight), height));
+    root.style.width = width + "px";
+    root.style.height = height + "px";
+    root.style.left = Math.max(16, right - width) + "px";
+    root.style.top = Math.max(16, bottom - height) + "px";
+    saveCurrentSize();
+  }
+  resizeHandle.addEventListener("pointerdown", function(event) {
+    if (event.button !== 0) return;
+    event.preventDefault();
+    resizeStart = { x: event.clientX, y: event.clientY, rect: root.getBoundingClientRect() };
+    resizeHandle.setPointerCapture(event.pointerId);
+  });
+  resizeHandle.addEventListener("pointermove", function(event) {
+    if (!resizeStart) return;
+    var rect = resizeStart.rect;
+    resizePanel(rect.width + resizeStart.x - event.clientX,
+      rect.height + resizeStart.y - event.clientY, rect.right, rect.bottom);
+  });
+  function finishResize() { resizeStart = null; saveCurrentSize(); }
+  resizeHandle.addEventListener("pointerup", finishResize);
+  resizeHandle.addEventListener("pointercancel", finishResize);
+  resizeHandle.addEventListener("lostpointercapture", finishResize);
+  resizeHandle.addEventListener("keydown", function(event) {
+    var delta = { ArrowLeft: [32, 0], ArrowRight: [-32, 0], ArrowUp: [0, 32], ArrowDown: [0, -32] }[event.key];
+    if (!delta) return;
+    event.preventDefault();
+    var rect = root.getBoundingClientRect();
+    resizePanel(rect.width + delta[0], rect.height + delta[1], rect.right, rect.bottom);
+  });
+
   	function setOpen(open) {
   		if (open) {
   			applyStoredSize();          // restore user's preferred size (if any)
@@ -350,14 +429,63 @@ function boot(cfg, host) {
   			model: MODEL
   		});
   	}
-  	var actionsSchemaEl = document.getElementById(ACTIONS_SCHEMA_ID);
-  	var localTools = actionsSchemaEl ? JSON.parse(actionsSchemaEl.textContent) : [];
+
+  	// Saving on every streamed delta would write to sessionStorage hundreds of
+  	// times for one answer, so the stream saves at most this often. The moments
+  	// that MUST save at once — the turn starting, a tool call about to run, the
+  	// turn ending — call persistConversation directly.
+  	var lastPersist = 0;
+  	function persistSoon() {
+  		if (Date.now() - lastPersist < 400) return;
+  		lastPersist = Date.now();
+  		persistConversation();
+  	}
+  	// The page card is the same static-primitives envelope a server puts in
+  	// its Server Card, delivered in the document. Its `tools` REPLACE the
+  	// older #ai-actions schema tag rather than merging with it: two sources
+  	// for one list means a reader has to work out which the page meant, and a
+  	// handler in window.aiActions answers to a name either way.
+  	//
+  	// Discovery is by MEDIA TYPE, which is the locator the spec defines: an id
+  	// the page chooses cannot be found by a client that was not told it.
+  	// Several blocks may appear, so a page built from components can let each
+  	// one declare its own primitives. `page-card-id` survives only as an escape
+  	// hatch for a host that cannot set the type, and is read when no typed
+  	// block is present.
+  	var typedCards = document.querySelectorAll('script[type="' + PAGE_CARD_MEDIA_TYPE + '"]');
+  	var pageCard;
+  	if (typedCards.length) {
+  		pageCard = mergeStaticPrimitivesCards(
+  			Array.prototype.map.call(typedCards, function(el) {
+  				return readStaticPrimitivesCard(el.textContent);
+  			}));
+  	} else {
+  		var pageCardEl = document.getElementById(PAGE_CARD_ID);
+  		pageCard = readStaticPrimitivesCard(pageCardEl ? pageCardEl.textContent : null);
+  	}
+  	// Where the page's handlers live. The card may declare a global, which is
+	// the only form an outside consumer can discover; the three legacy globals
+	// remain as a per-type fallback so a page moving over keeps working.
+	var handlers = pageHandlers({
+		card: pageCard,
+		scope: window,
+		legacy: { tools: ACTIONS_GLOBAL, prompts: PROMPTS_GLOBAL, resources: RESOURCES_GLOBAL }
+	});
+
+	var actionsSchemaEl = document.getElementById(ACTIONS_SCHEMA_ID);
+  	var localTools = pageCard.tools.length
+  		? pageCard.tools
+  		: (actionsSchemaEl ? JSON.parse(actionsSchemaEl.textContent) : []);
   	var remoteToolsEl = document.getElementById(REMOTE_TOOLS_SCHEMA_ID);
   	// remoteTools is a mutable live list: starts from the schema-provided
   	// baseline (if any), then the level-1 picker adds/removes entries as
   	// the visitor toggles server checkboxes. Passed to runChatLoop on
   	// every submit so the current selection is respected turn-by-turn.
-  	var remoteTools = remoteToolsEl ? JSON.parse(remoteToolsEl.textContent) : [];
+  	// Keep the baseline separately: refreshRemoteToolsFromPicker() rebuilds
+  	// remoteTools wholesale, so without a pristine copy the pre-configured
+  	// tools vanish the moment the picker first renders.
+  	var baselineRemoteTools = remoteToolsEl ? JSON.parse(remoteToolsEl.textContent) : [];
+  	var remoteTools = baselineRemoteTools.slice();
 
   	// Level-1 picker caches. hubMcpServers[] is the list of anon-visible
   	// servers fetched from GET /api/mcp_servers; each server has an
@@ -369,15 +497,18 @@ function boot(cfg, host) {
   	var hubMcpServers = [];
   	var selectedToolIds = new Set();
     var initializedToolServers = new Set();
+  	// A pre-configured tool IS a selection: seed the set so the picker renders
+  	// it checked and the visitor can turn it off, rather than the picker
+  	// silently overriding the page.
+  	baselineRemoteTools.forEach(function(t) { selectedToolIds.add(t.id); });
 
   	function anyAllowedByAllowlist(name, allowlist) {
   		return allowlist === null || allowlist.indexOf(name) >= 0;
   	}
 
   	function refreshRemoteToolsFromPicker() {
-  		// Flatten every SELECTED tool (across all servers) into remoteTools,
-  		// adapted to runChatLoop's expected { id, name, description, input_schema }.
   		var flat = [];
+  		var seen = {};
   		hubMcpServers.forEach(function(s) {
               // Apply initial defaults once, so subsequent reloads preserve
               // visitor changes and do not re-enable explicitly cleared tools.
@@ -391,6 +522,7 @@ function boot(cfg, host) {
 
   			(s.tools || []).forEach(function(t) {
   				if (!selectedToolIds.has(t.id)) return;
+  				seen[t.id] = true;
   				flat.push({
   					id:           t.id,
   					name:         t.name,
@@ -398,6 +530,12 @@ function boot(cfg, host) {
   					input_schema: t.input_schema
   				});
   			});
+  		});
+  		// A baseline tool whose server the picker never listed (not anon-visible,
+  		// or the fetch failed) has no checkbox to be found through — keep it
+  		// unless the visitor explicitly turned it off.
+  		baselineRemoteTools.forEach(function(t) {
+  			if (!seen[t.id] && selectedToolIds.has(t.id)) { flat.push(t); seen[t.id] = true; }
   		});
   		remoteTools = flat;
   		if (toolsCountEl) {
@@ -455,10 +593,21 @@ function boot(cfg, host) {
   					//   - Ollama:                   `available_models: [{ value, label, ... }]`
   					// Anon widget uses api_key_uuid = "ollama-local" so only Ollama models
   					// are invocable; filter to that family and use its subshape.
+  					// Learned from every family, not only the one the picker lists: the
+  					// configured model is often hosted while the picker shows local ones.
+  					llmsPayload = payload;
+  					modelWindow = modelWindowFrom(payload, MODEL);
   					var flat = [];
   					(payload.llms || []).forEach(function(llm) {
   						if (llm.family !== "ollama") return;
   						(llm.available_models || []).forEach(function(m) {
+  							// This widget exists to call tools — page actions and MCP. A model
+  							// that declares no tool support fails hard the moment any tool is
+  							// declared ("<model> does not support tools"), so offering it in the
+  							// picker is a trap: the visitor picks it and the next turn errors.
+  							// `=== false` on purpose — a hub that omits the field is older, not
+  							// a claim of no support, and must keep working.
+  							if (m.supports_tools === false) return;
   							if (anyAllowedByAllowlist(m.value, MODEL_ALLOWLIST)) {
   								flat.push({ value: m.value, label: m.label });
   							}
@@ -603,7 +752,12 @@ function boot(cfg, host) {
   	}
 
   	if (modelPicker) {
-  		modelPicker.addEventListener("change", function() { MODEL = modelPicker.value; });
+  		modelPicker.addEventListener("change", function() {
+  			MODEL = modelPicker.value;
+  			// The window belongs to the model, not to the session: a switch has to
+  			// move it, or every budget below is sized for the model left behind.
+  			modelWindow = modelWindowFrom(llmsPayload, MODEL);
+  		});
   	}
 
   	// Close the tools dropdown on any click outside its area. Native
@@ -630,14 +784,59 @@ function boot(cfg, host) {
   	// Fetch well-known MCP manifests at boot. Auto-discovers same origin
   	// if WELL_KNOWN_URLS is null; empty array disables entirely.
   	var hostWideTools = [];
-  	var hostWidePrompts = [];
+  	// The page's own prompts sit in the same list as the hub's: to a visitor
+  	// they are the same affordance. `source` is what routes prompts/get —
+  	// a page prompt has no endpoint to ask.
+  	var hostWidePrompts = pageCard.prompts.map(function(p) {
+  		return Object.assign({}, p, { source: "page" });
+  	});
+  	// How much room the selected model has, from /api/llms. null until that
+  	// call answers, and null forever if the hub is older than the field — in
+  	// which case the loop budgets nothing, exactly as it always did.
+  	var modelWindow = null;
+  	// The /api/llms answer, kept so switching model in the picker can resolve
+  	// that model's window. Without it a visitor who switches from a 262k model
+  	// to a 32k one keeps the big window — no eviction, and a resource budget
+  	// far larger than the small model can hold.
+  	var llmsPayload = null;
   	var resourceContext = null;   // payload of the host's reference resource
   	var resourcePlan = null;      // the pre-flight decision, kept so Clear can re-arm the gate
 
   	// Beyond ~2k tokens a reference resource starts crowding out the
   	// conversation on a 32k-context local model — production PubDictionaries
-  	// is 218 dictionaries / ~35KB / ~10k tokens.
-  	var RESOURCE_BUDGET_BYTES = 8000;
+  	// is 218 dictionaries / ~35KB / ~10k tokens. That share of the window is
+  	// what scales now the window is known: 8000 remains the 32k case, and the
+  	// floor for a model whose window the hub does not report.
+  	function resourceBudget() { return resourceBudgetBytes(modelWindow); }
+
+  	// The page's own resources, planned from the card — but NOT here. Unlike
+  	// the hub's single reference resource these are a list: a page declares one
+  	// per thing it knows, each with its own description.
+  	//
+  	// Planning them at this point would pin every one of them to the floor
+  	// budget: the budget follows the model's window, which arrives with
+  	// /api/llms a moment after this runs. The budget was derived and then
+  	// never used, so a 128k model could attach nothing a 32k one could not.
+  	// Re-planned whenever the budget changes, which is at most once per model
+  	// switch.
+  	var pageResourcePlans = null;
+  	var pageResourcePlansBudget = null;
+  	function pageResourcePlansNow() {
+  		var budget = resourceBudget();
+  		if (pageResourcePlans === null || budget !== pageResourcePlansBudget) {
+  			pageResourcePlansBudget = budget;
+  			pageResourcePlans = planPageResources({
+  				entries:     pageCard.resources,
+  				budgetBytes: budget,
+  				onSkip: function(plan) {
+  					console.info("[llm_meta_widget] not attaching " + plan.uri +
+  					             " (" + plan.reason + ", size=" + plan.size + ")");
+  				}
+  			});
+  		}
+  		return pageResourcePlans;
+  	}
+  	var pageResourceCache = {};
 
 
   	// Before anything asynchronous: if this page was navigated away from and
@@ -645,6 +844,12 @@ function boot(cfg, host) {
   	restoreConversation();
     updateExchangeUi();
 
+  	// Looked up BEFORE the discovery IIFE, not after it. That block calls
+  	// renderPromptButtons(), and with no well-known URLs to fetch it has no
+  	// await at all — so it ran while this was still undefined and the render
+  	// bailed at its own guard. A page that declares its own prompts is
+  	// exactly the case with nothing to await.
+  	var promptsEl = root.querySelector(".lmw-prompts");
   	var wellKnownReady = (async function() {
   		var urls = WELL_KNOWN_URLS === null
   			? [ window.location.origin + "/.well-known/mcp.json" ]
@@ -673,12 +878,12 @@ function boot(cfg, host) {
   				// the bug this shape prevents.
   				var loaded = await loadHostResource({
   					endpoint:    endpoint,
-  					budgetBytes: RESOURCE_BUDGET_BYTES,
+  					budgetBytes: resourceBudget(),
   					list:        listMcpResources,
   					read:        readMcpResource,
   					onSkip: function(plan) {
   						console.info("[llm_meta_widget] not attaching " + plan.uri +
-  						             " (" + plan.reason + ", sizeBytes=" + plan.sizeBytes + ")");
+  						             " (" + plan.reason + ", size=" + plan.size + ")");
   					}
   				});
   				// A volatile resource comes back with no context — it is read
@@ -701,7 +906,15 @@ function boot(cfg, host) {
   	// the message (prompts/get), then drops the text into the textarea and
   	// submits — so it travels the exact path a typed message does.
 
-  	var promptsEl = root.querySelector(".lmw-prompts");
+
+  	// Where a prompt's declared arguments are filled from. A card-only page keeps
+  	// its state in aiResources under `page:<name>` URIs, so the names the resolver
+  	// looks up live there, not in aiState.
+  	function argState() {
+  		return promptArgState({ entries: pageCard.resources,
+  		                        resources: handlers.resources,
+  		                        state: window[STATE_GLOBAL] || {} });
+  	}
 
   	function renderPromptButtons() {
   		if (!promptsEl) return;
@@ -743,7 +956,9 @@ function boot(cfg, host) {
   			});
   			if (body.parentNode) body.parentNode.appendChild(row);
   		});
-  		historyEl.scrollTop = historyEl.scrollHeight;
+  		// Unconditional: a restored conversation opens at its end, which is where
+  		// the reader left off. Nothing is streaming yet, so nobody is being yanked.
+  		pinToBottom();
   		return true;
   	}
 
@@ -767,7 +982,7 @@ function boot(cfg, host) {
   			(hostWidePrompts.length ? ", or start with one of these:" : ".");
   		box.appendChild(hello);
 
-  		var state = window[STATE_GLOBAL] || {};
+  		var state = argState();
   		hostWidePrompts.forEach(function(prompt) {
   			var props = promptButtonProps(prompt);
   			var card  = document.createElement("div");
@@ -810,7 +1025,7 @@ function boot(cfg, host) {
   	}
 
   	async function runPromptTemplate(prompt, button) {
-  		var resolved = resolvePromptArguments(prompt, window[STATE_GLOBAL] || {});
+  		var resolved = resolvePromptArguments(prompt, argState());
   		var args = resolved.args;
   		var missing = resolved.missing;
 
@@ -824,7 +1039,9 @@ function boot(cfg, host) {
 
   		button.disabled = true;
   		try {
-  			var result = await getMcpPrompt({ endpoint: prompt.endpoint, name: prompt.name, args: args });
+  			var result = prompt.source === "page"
+  				? await getPagePrompt({ name: prompt.name, args: args, prompts: handlers.prompts })
+  				: await getMcpPrompt({ endpoint: prompt.endpoint, name: prompt.name, args: args });
   			var text = promptMessagesToText(result);
   			if (!text) { appendTurn("error", "The server returned an empty prompt."); return; }
   			inputEl.value = text;
@@ -845,6 +1062,8 @@ function boot(cfg, host) {
   	var pendingTurnLabel = null;
 
   	function appendTurn(role, text, turnLabel) {
+  		// Captured BEFORE anything is added: see atBottom.
+  		var following = atBottom();   // a question always wins
   		// Class names mirror llm_meta_chat's chats/_message.html.erb —
   		// `.message.<role>`, `.message-role`, `.message-content` — so the
   		// shared conversation.css styles apply directly (see the <link>
@@ -883,7 +1102,9 @@ function boot(cfg, host) {
   		div.appendChild(document.createTextNode(" "));
   		div.appendChild(body);
   		historyEl.appendChild(div);
-  		historyEl.scrollTop = historyEl.scrollHeight;
+  		// A question the visitor just asked always goes to the end; anything
+  		// else respects where they were reading.
+  		if (role === "user" || following) pinToBottom();
   		body.roleLabel = label;   // so a turn in flight can show it is working
   		return body;
   	}
@@ -895,6 +1116,31 @@ function boot(cfg, host) {
   	function renderMarkdownInto(el, mdText) {
   		try { el.innerHTML = marked.parse(mdText); }
   		catch (e) { el.textContent = mdText; }  // fall back to raw on parse error
+  		wrapTablesForScrolling(el);
+  	}
+
+  	// A markdown table gets its own horizontal scroller.
+  	//
+  	// `display: block; overflow-x: auto; max-width: 100%` on the table alone
+  	// does NOT do this: the box is capped at the bubble width, so the table
+  	// re-lays out to fit and squeezes its columns, and `word-wrap: break-word`
+  	// from .message then breaks every word one character per line. A six-column
+  	// table of genomic notation became a column of single letters thousands of
+  	// pixels tall (seen on PubDictionaries, 2026-10-16).
+  	//
+  	// The table has to sit INSIDE a capped box and keep its own natural width,
+  	// which is what a wrapper gives it.
+  	function wrapTablesForScrolling(el) {
+  		var tables = el.querySelectorAll("table");
+  		for (var i = 0; i < tables.length; i++) {
+  			var table = tables[i];
+  			// No already-wrapped guard: renderMarkdownInto replaces the whole
+  			// innerHTML first, so every table reaching here is freshly parsed.
+  			var wrap = document.createElement("div");
+  			wrap.className = "lmw-table-scroll";
+  			table.parentNode.insertBefore(wrap, table);
+  			wrap.appendChild(table);
+  		}
   	}
 
   	// Role labels mirror llm_meta_chat's chats/_message.html.erb:
@@ -963,6 +1209,8 @@ function boot(cfg, host) {
   	}
 
   	function announceToolCall(toolCall) {
+  		// Captured BEFORE anything is added: see atBottom.
+  		var following = atBottom();
   		var row = chipRow();
   		if (!row) return;
   		var chip = document.createElement("span");
@@ -971,7 +1219,7 @@ function boot(cfg, host) {
   		chip.dataset.tool = toolCall.name;
   		row.appendChild(chip);
   		pendingChips.push(chip);
-  		historyEl.scrollTop = historyEl.scrollHeight;
+  		if (following) pinToBottom();
   	}
 
   	function resolveToolCall(outcome) {
@@ -993,6 +1241,8 @@ function boot(cfg, host) {
   	var activeAssistantBody  = null;
 
   	function ensureThinkingBlock() {
+  		// Captured BEFORE anything is added: see atBottom.
+  		var following = atBottom();
   		if (currentThinkingBody) return currentThinkingBody;
   		// Class names match llm_meta_chat's .message-thinking pattern so
   		// the shared conversation.css applies directly.
@@ -1019,30 +1269,117 @@ function boot(cfg, host) {
   		} else {
   			historyEl.appendChild(details);
   		}
-  		historyEl.scrollTop = historyEl.scrollHeight;
+  		if (following) pinToBottom();
   		currentThinkingBlock = details;
   		currentThinkingBody  = body;
   		return body;
   	}
 
+  	// Collapsing a thinking block is what broke scrolling in Chrome.
+  	//
+  	// A thinking block is a <details> holding its own scroller (max-height +
+  	// overflow-y on .message-thinking-content). Closing it with `open = false`
+  	// at a moment when that block is the only reason .lmw-messages overflows
+  	// makes the list briefly non-scrollable. When later content makes it
+  	// scrollable again, Chrome keeps the WHEEL range from that moment — tens of
+  	// pixels — while scrollTop and scrollHeight stay correct. So the reader can
+  	// scroll a few pixels and no further, by any input method, while
+  	// `scrollTop = 600` set from script still works. Chrome 154 reproduces it
+  	// with no widget code at all; Firefox 158 never does.
+	// https://issues.chromium.org/issues/574960594 — docs/chromium-scroll-bug.md has the
+	// measurements and a self-checking test case. Remove this once the fix
+	// has shipped widely enough.
+  	//
+  	// Taking the scroller off the inner box BEFORE the close avoids the state.
+  	// Two frames, because one is not enough for Chrome to pick up the new
+  	// overflow before the close lands.
+  	//
+  	// The box stays a non-scroller afterwards, so a reader who reopens a
+  	// finished block sees it at full height instead of a 10em window. Putting
+  	// the scroller back on reopen would let a manual close trigger the bug
+  	// again, which is a worse trade.
   	function collapseThinkingBlock() {
-  		if (currentThinkingBlock) {
-  			currentThinkingBlock.classList.remove("thinking-active");
-  			currentThinkingBlock.open = false;
-  			var summary = currentThinkingBlock.querySelector("summary");
-  			if (summary) summary.textContent = "🤔 thinking (finished)";
-  		}
+  		var block = currentThinkingBlock;
   		currentThinkingBlock = null;
   		currentThinkingBody  = null;
+  		if (!block) return;
+
+  		block.classList.remove("thinking-active");
+  		var summary = block.querySelector("summary");
+  		if (summary) summary.textContent = "🤔 thinking (finished)";
+
+  		var body = block.querySelector(".message-thinking-content");
+  		if (body) {
+  			body.style.overflow  = "visible";
+  			body.style.maxHeight = "none";
+  		}
+  		if (typeof requestAnimationFrame !== "function") { block.open = false; return; }
+  		requestAnimationFrame(function() {
+  			requestAnimationFrame(function() { block.open = false; });
+  		});
+  	}
+
+  	// Every declaration channel the widget hands the model carries a
+  	// developer-authored description — Class 3 action schemas, Class 2
+  	// .well-known tools, Class 1 hub tools, static-primitives resources. State
+  	// readers used to be the exception: the model saw a bare key and had to
+  	// infer meaning from its name, which holds for `text` and falls apart for
+  	// `annotation_mode` or `pending_merges`. Each reader now declares what it
+  	// returns, in the same shape as everything else.
+  	//
+  	// The bare-function form is GONE as of 0.8.0 — no fallback branch. A page
+  	// that still uses it is told exactly what to change, per key, and that key
+  	// is skipped; the rest of the page still works.
+  	function stateReaders() {
+  		var declared = window[STATE_GLOBAL] || {};
+  		var out = [];
+  		Object.keys(declared).forEach(function(key) {
+  			var entry = declared[key];
+  			var hasDescription = entry && typeof entry.description === "string" && entry.description.trim() !== "";
+  			var hasRead        = entry && typeof entry.read === "function";
+  			if (!hasDescription || !hasRead) {
+  				console.error(
+  					"[llm-meta-widget] " + STATE_GLOBAL + "." + key + " is not a valid state reader. " +
+  					"Expected { description: \"what this value is\", read: function () { … } }, got " +
+  					(typeof entry === "function" ? "a bare function (the 0.7 form, removed in 0.8)" : describeValue(entry)) +
+  					". Skipping " + key + "."
+  				);
+  				return;
+  			}
+  			out.push({ key: key, description: entry.description, read: entry.read });
+  		});
+  		return out;
+  	}
+
+  	function describeValue(v) {
+  		if (v === null) return "null";
+  		if (Array.isArray(v)) return "an array";
+  		if (typeof v === "object") {
+  			var missing = [];
+  			if (typeof v.description !== "string" || v.description.trim() === "") missing.push("description");
+  			if (typeof v.read !== "function") missing.push("read");
+  			return "an object missing " + missing.join(" and ");
+  		}
+  		return typeof v;
   	}
 
   	function currentPageState() {
-  		var reader = window[STATE_GLOBAL] || {};
-  		var out = {};
-  		Object.keys(reader).forEach(function(k) {
-  			try { out[k] = reader[k](); } catch (e) { out[k] = "<error: " + e.message + ">"; }
+  		return stateReaders().map(function(r) {
+  			var value;
+  			try { value = r.read(); } catch (e) { value = "<error: " + e.message + ">"; }
+  			return { key: r.key, description: r.description, value: value };
   		});
-  		return out;
+  	}
+
+  	// One line per reader, with its description inline. A separate glossary
+  	// above the values would make the model match names across two lists; the
+  	// point is that it reads the meaning and the value together.
+  	function pageStateLines() {
+  		var readers = currentPageState();
+  		if (readers.length === 0) return [ "(this page declares no state)" ];
+  		return readers.map(function(r) {
+  			return "- " + r.key + " (" + r.description + "): " + JSON.stringify(r.value);
+  		});
   	}
 
   	function currentSystemPrompt(resourceLines) {
@@ -1055,9 +1392,8 @@ function boot(cfg, host) {
   			"3. After a tool returns a result, use it: either take the next step the task needs, or — if the task is done — answer in plain text. Do not stop silently after a tool call.",
   			"4. NEVER repeat a call you have already made with the same or similar arguments — its result is already in the conversation history.",
   			"",
-  			"Current page state:",
-  			JSON.stringify(currentPageState(), null, 2)
-  		].concat(resourceLines || []).join("\n");
+  			"Current page state:"
+  		].concat(pageStateLines()).concat(resourceLines || []).join("\n");
   	}
 
   	// Runs once per send, before the system prompt is built: a volatile
@@ -1070,10 +1406,21 @@ function boot(cfg, host) {
   			cached:      resourceContext,
   			endpoint:    resourcePlan && resourcePlan.endpoint,
   			read:        readMcpResource,
-  			budgetBytes: RESOURCE_BUDGET_BYTES
+  			budgetBytes: resourceBudget()
   		});
   		resourceContext = turn.cached;
-  		return turn.lines;
+
+  		// The page's own resources ride in the same per-turn slot as the hub's.
+  		// Volatile ones are re-read here, which is the whole point: a form field
+  		// read at boot is already stale by the time anyone sends a message.
+  		var page = await pageResourceLinesForTurn({
+  			plans:       pageResourcePlansNow(),
+  			resources:   handlers.resources,
+  			budgetBytes: resourceBudget(),
+  			cache:       pageResourceCache
+  		});
+  		pageResourceCache = page.cache;
+  		return turn.lines.concat(page.lines);
   	}
 
   	// Per-turn AbortController — lets the Clear button (or a new submit)
@@ -1136,6 +1483,13 @@ function boot(cfg, host) {
   				.concat(priorConversation.map(function(t) { return { role: t.role, content: t.content }; }))
   				.concat([{ role: "user", content: userText }]);
 
+  			// Recorded before the loop runs, and saved, so a page action that
+  			// navigates cannot take the turn with it. `messages` above was already
+  			// built from the previous turns, so this does not double-send anything.
+  			var liveTurn = { role: "assistant", content: "", tools: [] };
+  			conversation.push(liveTurn);
+  			persistConversation();
+
   			var result = await runChatLoop({
   				baseUrl:       LLM_BASE,
   				toolHubUrl:    TOOL_HUB_BASE,
@@ -1146,12 +1500,52 @@ function boot(cfg, host) {
   				localTools:    localTools,
   				remoteTools:   remoteTools,
   				hostWideTools: hostWideTools,
-  				aiActions:     window[ACTIONS_GLOBAL] || {},
+  				aiActions:     handlers.tools,
   				maxRounds:     MAX_ROUNDS,
+  				contextWindow: modelWindow,
   				provider:      LLM_PROVIDER === "ollama" ? "ollama" : "hub",
   				signal:        currentAbort.signal,
-          onToolCall: function(toolCall) { markWorking(assistantBody.roleLabel, "ツールを実行しています…"); announceToolCall(toolCall); },
-          onToolDispatched: function(outcome) { resolveToolCall(outcome); markWorking(assistantBody.roleLabel, "ツール結果をもとに回答を準備しています…"); },
+  				onContextTruncated: function(list) {
+  					// A shortened result is not a failure, but the reader has to know the
+  					// model answered from part of it — and the numbers say whether a narrower
+  					// question would help.
+  					var cut = list[list.length - 1] || {};
+  					appendTurn("system", "Shortened an oversized " + (cut.name || "tool") + " result to fit the context: " +
+  						thousands(cut.fromTokens || 0) + " tokens, where one result may use at most " +
+  						thousands(cut.toTokens || 0) + ". Ask again with a narrower question for the complete result.");
+  				},
+  				onContextEvicted: function(info) {
+  					// Said out loud, with the numbers. A context that quietly thins out makes
+  					// a later answer look inexplicably worse, and "an old result was dropped"
+  					// alone does not tell a reader whether to retry, shorten the question, or
+  					// pick a model with more room.
+  					var dropped = info.dropped || [];
+  					var names = dropped.map(function(d) { return d.name || "a tool"; });
+  					var what = names.length === 1
+  						? "the earliest tool result (" + names[0] + ")"
+  						: "the " + names.length + " earliest tool results (" + names.join(", ") + ")";
+  					var sizes = (info.needed && info.window)
+  						? " About " + thousands(info.needed) + " tokens were needed and " +
+  						  thousands(info.window) + " fit in " + MODEL + "'s context."
+  						: "";
+  					appendTurn("system", "Dropped " + what + " to make room." + sizes +
+  						" Ask again, or narrow the question, for an answer based on complete tool results.");
+  				},
+  				onToolCall: function(toolCall) {
+          markWorking(assistantBody.roleLabel, "ツールを実行しています…");
+  					announceToolCall(toolCall);
+  					// At once, not throttled: this call may be the one that navigates, and
+  					// after it nothing of this turn would be saved.
+  					persistConversation();
+  				},
+  				onToolDispatched: function(outcome) {
+          markWorking(assistantBody.roleLabel, "ツール結果をもとに回答を準備しています…");
+  					resolveToolCall(outcome);
+  					liveTurn.tools = liveTurn.tools.concat([ outcome.error
+  						? { name: outcome.toolCall.name, error: true }
+  						: { name: outcome.toolCall.name } ]);
+  					persistConversation();
+  				},
   				onPhase: function(name) {
   					// 'thinking' covers the long silence before the first
   					// token; 'responding' means text is on its way.
@@ -1174,27 +1568,33 @@ function boot(cfg, host) {
   					collapseThinkingBlock();
   				},
   				onThinkingDelta: function(delta) {
+  					// Captured BEFORE anything is added: see atBottom.
+  					var following = atBottom();
   					var body = ensureThinkingBlock();
   					body.appendChild(document.createTextNode(delta));
   					body.scrollTop = body.scrollHeight;
-  					historyEl.scrollTop = historyEl.scrollHeight;
+  					if (following) pinToBottom();
   				},
   				onTextDelta: function(delta) {
-            markWorking(assistantBody.roleLabel, "回答を生成しています…");
+  					// Captured BEFORE anything is added: see atBottom.
+  					var following = atBottom();
+          markDone(assistantBody.roleLabel);
   					collapseThinkingBlock();
   					assistantMarkdown += delta;
   					renderMarkdownInto(assistantBody, assistantMarkdown);
-  					historyEl.scrollTop = historyEl.scrollHeight;
+  					liveTurn.content = assistantMarkdown;
+  					persistSoon();
+  					if (following) pinToBottom();
   				}
   			});
-  			conversation.push({
-  				role:    "assistant",
-  				content: result.content,
-  				// Kept so a restored transcript still shows what ran — losing
-  				// that record is what made a navigating action unbearable.
-  				tools:   result.dispatched.map(function(d) {
-  					return d.error ? { name: d.toolCall.name, error: true } : { name: d.toolCall.name };
-  				})
+  			// The turn was recorded here until 0.11.1, after the loop returned — which
+  			// a page action that navigates never lets happen. Submitting a form
+  			// mid-turn therefore lost the whole turn: the question, whatever the
+  			// assistant had already said, and the record of what ran. It is recorded as
+  			// it happens now, and only finalised here.
+  			liveTurn.content = result.content;
+  			liveTurn.tools = result.dispatched.map(function(d) {
+  				return d.error ? { name: d.toolCall.name, error: true } : { name: d.toolCall.name };
   			});
   			persistConversation();
 

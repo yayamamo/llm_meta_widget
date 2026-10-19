@@ -27,7 +27,7 @@
 		/* Native drag-to-resize handle appears at bottom-right when
 		 * overflow != visible. overflow:hidden clips at widget edge; the
 		 * inner .lmw-messages has its own scroll so no content is lost. */
-		resize: both;
+		resize: none;
 		overflow: hidden;
 	}
 	#llm-meta-widget-chat.lmw-collapsed { display: none; }
@@ -88,6 +88,21 @@
 		min-height: 26px;
 	}
 	#llm-meta-widget-chat .lmw-title { font-weight: 600; color: #1f2937; }
+
+	/* Attribution back to the service that answers these chats. The header is
+	 * `space-between` with two children, so the title and the link travel
+	 * together in one group — otherwise the link lands in the middle of the
+	 * bar, visually detached from the title it qualifies. */
+	#llm-meta-widget-chat .lmw-title-group {
+		display: flex; align-items: baseline; gap: 6px; min-width: 0;
+	}
+	/* The wrapper is plain text; only the service NAME is clickable, so the
+	 * link target is the word a reader would aim at. */
+	#llm-meta-widget-chat .lmw-powered {
+		font-size: 11px; color: #6b7280; white-space: nowrap;
+	}
+	#llm-meta-widget-chat .lmw-powered a { color: inherit; text-decoration: underline; }
+	#llm-meta-widget-chat .lmw-powered a:hover { color: #2563eb; }
 
 	/* Level-1 model picker — compact <select> next to the title.
 	 * Populated by JS on widget open from GET /api/llms (anon path
@@ -370,3 +385,13 @@
 }
 #llm-meta-widget-chat .lmw-auth-message { margin: 0 0 12px; }
 #llm-meta-widget-chat .lmw-auth-link { color: #1d4ed8; text-decoration: underline; }
+
+/* A visible top-left grip works even when the panel is anchored bottom-right. */
+#llm-meta-widget-chat { min-width: min(24em, calc(100vw - 32px)); min-height: min(16em, calc(100vh - 32px)); }
+#llm-meta-widget-chat .lmw-header { padding-left: 24px; }
+#llm-meta-widget-chat .lmw-resize {
+  position: absolute; top: 4px; left: 4px; width: 24px; height: 24px;
+  padding: 0; border: 0; background: transparent; color: #64748b;
+  cursor: nwse-resize; touch-action: none; font-size: 20px;
+}
+#llm-meta-widget-chat .lmw-resize:focus-visible { outline: 2px solid #2563eb; border-radius: 3px; }

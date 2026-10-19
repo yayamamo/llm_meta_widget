@@ -15,12 +15,17 @@ import { resourceHints, planResourceAttachment, trimResourceText,
          loadHostResource, resourceLinesForTurn,
          parseNdjsonStream, ollamaChatCall, fetchOllamaModels,
          packConversation, unpackConversation, createConversationStore, conversationKeyFor,
-         promptArgFromState, resolvePromptArguments, promptButtonProps,
+         promptArgFromState, promptArgState, resolvePromptArguments, promptButtonProps,
          promptArgumentSummary,
          STATIC_PRIMITIVES_META,
          parseSseStream, dispatchLocalToolCalls, runChatLoop, callMcpTool, fetchMcpManifest,
          listMcpPrompts, getMcpPrompt, listMcpResources, readMcpResource,
-         promptMessagesToText } from "./orchestrator.js"
+         promptMessagesToText, readStaticPrimitivesCard, getPagePrompt, planPageResources, pageResourceLinesForTurn, pageResourceLine,
+         mergeStaticPrimitivesCards, PAGE_CARD_MEDIA_TYPE,
+         declaredPageGlobal, pageHandlers,
+         modelWindowFrom, estimateTokens, evictOldToolResults,
+         resourceBudgetBytes, estimateToolsTokens,
+         estimateTextTokens, truncateOversizedToolResults } from "./orchestrator.js"
 
 // --- fixtures --------------------------------------------------------------
 
@@ -959,7 +964,7 @@ const CATALOG = JSON.stringify({ dictionaries: [ { name: "uberon" } ] })
 
 test("resourceHints reads all three extension fields", () => {
   const h = resourceHints(withMeta({ sizeBytes: 1298, volatility: "volatile", autoAttach: false }))
-  assert.equal(h.sizeBytes, 1298)
+  assert.equal(h.size, 1298)
   assert.equal(h.volatility, "volatile")
   assert.equal(h.autoAttach, false)
 })
@@ -968,7 +973,7 @@ test("resourceHints defaults to stable and auto-attach when nothing is declared"
   // A hint-unaware server must behave exactly as it did before the
   // extension existed: attach once, on the first turn.
   const h = resourceHints({ uri: "x://y" })
-  assert.equal(h.sizeBytes, null)
+  assert.equal(h.size, null)
   assert.equal(h.volatility, "stable")
   assert.equal(h.autoAttach, true)
 })
@@ -986,9 +991,86 @@ test("resourceHints ignores a non-boolean autoAttach", () => {
   assert.equal(resourceHints(withMeta({ autoAttach: "false" })).autoAttach, true)
 })
 
-test("resourceHints reports an unusable sizeBytes as unknown, not zero", () => {
-  assert.equal(resourceHints(withMeta({ sizeBytes: "1298" })).sizeBytes, null)
-  assert.equal(resourceHints(withMeta({ sizeBytes: Infinity })).sizeBytes, null)
+test("resourceHints reports an unusable size as unknown, not zero", () => {
+  assert.equal(resourceHints(withMeta({ sizeBytes: "1298" })).size, null)
+  assert.equal(resourceHints(withMeta({ sizeBytes: Infinity })).size, null)
+  assert.equal(resourceHints({ uri: "x://y", size: "1298" }).size, null)
+  assert.equal(resourceHints({ uri: "x://y", size: Infinity }).size, null)
+})
+
+// SEP-0000 dropped its own `sizeBytes` and reuses the base Resource `size`
+// field, strengthened to "MUST be exact when present". Both spellings are read
+// for one release: a client that only understood the new one would lose its
+// budget gate against a server still on the old draft — PubDictionaries was,
+// when this landed.
+test("resourceHints reads size from the base Resource field", () => {
+  assert.equal(resourceHints({ uri: "x://y", size: 30026 }).size, 30026)
+})
+
+test("resourceHints still reads the earlier draft's _meta.sizeBytes", () => {
+  assert.equal(resourceHints(withMeta({ sizeBytes: 30026 })).size, 30026)
+})
+
+test("the base field wins when a server declares both", () => {
+  const entry = { ...withMeta({ sizeBytes: 999 }), size: 30026 }
+
+  assert.equal(resourceHints(entry).size, 30026)
+})
+
+// `size: 0` is a declared empty payload, not an absent one — and an empty
+// payload really is free. The distinction rests on `??` rather than `||`:
+// with `||` a declared 0 would fall through to the legacy field and a
+// zero-byte resource would inherit someone else's size.
+// orchestrator.js is a published entry point ("./orchestrator" in the package
+// exports), so anything these functions return is public API. Renaming the
+// field would therefore have been a breaking change; the old name is kept as an
+// alias for one release so 0.8.6 stays additive on BOTH sides — inputs accept
+// either spelling, outputs provide either. Both go at 0.9.0.
+test("the old field name still works on resourceHints", () => {
+  const h = resourceHints({ uri: "x://y", size: 30026 })
+
+  assert.equal(h.size, 30026)
+  assert.equal(h.sizeBytes, 30026)
+})
+
+test("the old field name still works on planResourceAttachment", () => {
+  // Easy to miss: this function rebuilds its own result object, so an alias on
+  // resourceHints does not reach it.
+  const over = planResourceAttachment({ uri: "x://y", size: 35318 }, 8000)
+  const fits = planResourceAttachment({ uri: "x://y", size: 100 }, 8000)
+
+  assert.equal(over.sizeBytes, 35318)
+  assert.equal(fits.sizeBytes, 100)
+})
+
+test("the alias reports unknown as null, like the field it mirrors", () => {
+  assert.equal(planResourceAttachment({ uri: "x://y" }, 8000).sizeBytes, null)
+  assert.equal(resourceHints({ uri: "x://y" }).sizeBytes, null)
+})
+
+test("a declared size of zero is kept, not treated as absent", () => {
+  assert.equal(resourceHints({ uri: "x://y", size: 0 }).size, 0)
+})
+
+test("a declared zero still wins over the earlier draft's field", () => {
+  const entry = { ...withMeta({ sizeBytes: 999 }), size: 0 }
+
+  assert.equal(resourceHints(entry).size, 0)
+})
+
+test("resourceHints survives an absent entry", () => {
+  // planResourceAttachment hands it whatever the server listed, and a
+  // malformed listing should not take the turn down with it.
+  assert.equal(resourceHints(undefined).size, null)
+  assert.equal(resourceHints(undefined).volatility, "stable")
+  assert.equal(resourceHints(null).autoAttach, true)
+})
+
+test("a budget gate works against either spelling", () => {
+  // The point of accepting both: neither an old nor a new server slips an
+  // over-budget resource past the gate during the migration.
+  assert.equal(planResourceAttachment({ uri: "x://y", size: 35318 }, 8000).reason, "over-budget")
+  assert.equal(planResourceAttachment(withMeta({ sizeBytes: 35318 }), 8000).reason, "over-budget")
 })
 
 test("planResourceAttachment attaches a resource that fits the budget", () => {
@@ -1206,9 +1288,17 @@ test("a volatile re-read is trimmed against the budget too", async () => {
 
 // ---- prompt templates ---------------------------------------------------
 
+// 0.8.0 shape: every reader declares what it returns. The bare-function form
+// is gone, so a fixture using it would no longer be a reader at all.
 const pageState = {
-  text: () => "The stomach was examined.",
-  selected_dictionaries: () => [ "uberon", "mondo_disease" ]
+  text: {
+    description: "the text the user wants to annotate",
+    read: () => "The stomach was examined."
+  },
+  selected_dictionaries: {
+    description: "the dictionaries the user has chosen",
+    read: () => [ "uberon", "mondo_disease" ]
+  }
 }
 
 test("promptArgFromState reads an argument named after a page reader", () => {
@@ -1224,11 +1314,20 @@ test("promptArgFromState returns empty for an argument the page cannot supply", 
 })
 
 test("promptArgFromState survives a throwing page reader", () => {
-  assert.equal(promptArgFromState("text", { text: () => { throw new Error("page bug") } }), "")
+  assert.equal(promptArgFromState("text", { text: { description: "d", read: () => { throw new Error("page bug") } } }), "")
 })
 
 test("promptArgFromState treats an empty selection as nothing to fill with", () => {
-  assert.equal(promptArgFromState("dictionaries", { selected_dictionaries: () => [] }), "")
+  assert.equal(promptArgFromState("dictionaries", { selected_dictionaries: { description: "d", read: () => [] } }), "")
+})
+
+test("promptArgFromState ignores the removed bare-function form", () => {
+  // 0.8.0 breaking change: a bare function is not a reader. It must not be
+  // called — silently filling from it would hide the page's outdated shape.
+  let called = false
+  const legacy = { text: () => { called = true; return "should not be used" } }
+  assert.equal(promptArgFromState("text", legacy), "")
+  assert.equal(called, false)
 })
 
 test("resolvePromptArguments fills what the page has", () => {
@@ -1241,7 +1340,7 @@ test("resolvePromptArguments fills what the page has", () => {
 test("resolvePromptArguments names the required arguments the page cannot fill", () => {
   // The user can fix an empty text box; they cannot fix a -32602.
   const prompt = { arguments: [ { name: "text", required: true }, { name: "dictionaries", required: true } ] }
-  const { args, missing } = resolvePromptArguments(prompt, { selected_dictionaries: () => [ "uberon" ] })
+  const { args, missing } = resolvePromptArguments(prompt, { selected_dictionaries: { description: "chosen dictionaries", read: () => [ "uberon" ] } })
   assert.deepEqual(args, { dictionaries: "uberon" })
   assert.deepEqual(missing, [ "text" ])
 })
@@ -1302,7 +1401,7 @@ test("the element reads its config through config.js rather than inlining it", (
 
 test("promptArgumentSummary shows which slots the page can already fill", () => {
   const prompt = { arguments: [ { name: "text", required: false }, { name: "dictionaries", required: false } ] }
-  const summary = promptArgumentSummary(prompt, { text: () => "The stomach was examined." })
+  const summary = promptArgumentSummary(prompt, { text: { description: "the text to annotate", read: () => "The stomach was examined." } })
 
   assert.deepEqual(summary.map((s) => [ s.name, s.filled ]), [ [ "text", true ], [ "dictionaries", false ] ])
   assert.equal(summary[0].value, "The stomach was examined.")
@@ -1632,4 +1731,913 @@ test("the key ignores the query string, so a form submit keeps its conversation"
   assert.equal(before, after)
   assert.notEqual(before, conversationKeyFor({ pathname: "/dictionaries" }),
                   "a different page is a different conversation")
+})
+
+// ---- page card ----------------------------------------------------------
+//
+// The same static-primitives envelope a server puts in its Server Card, read
+// from a <script> in the page instead. Parsing only: what a declaration means
+// is resolved elsewhere. A card is host-authored, so a typo must cost that one
+// entry and never the assistant.
+const CARD = (ext) => JSON.stringify({ _meta: { "io.modelcontextprotocol/static-primitives": ext } })
+const quiet = () => {}
+
+test("reads the three primitive arrays out of the envelope", () => {
+  const card = readStaticPrimitivesCard(CARD({
+    tools: [ { name: "set_text" } ],
+    prompts: [ { name: "annotate" } ],
+    resources: [ { uri: "page:text" } ]
+  }), quiet)
+
+  assert.deepEqual(card.tools.map((t) => t.name), [ "set_text" ])
+  assert.deepEqual(card.prompts.map((p) => p.name), [ "annotate" ])
+  assert.deepEqual(card.resources.map((r) => r.uri), [ "page:text" ])
+})
+
+test("a card with no envelope is ignored, not guessed at", () => {
+  // Bare arrays at the top level are NOT the shape: the envelope is what makes
+  // it the same document a Server Card carries.
+  const card = readStaticPrimitivesCard(JSON.stringify({ tools: [ { name: "x" } ] }), quiet)
+
+  assert.deepEqual(card, { remotes: [], tools: [], prompts: [], resources: [] })
+})
+
+test("malformed JSON costs the card, not the turn", () => {
+  assert.deepEqual(readStaticPrimitivesCard("{not json", quiet),
+                   { remotes: [], tools: [], prompts: [], resources: [] })
+})
+
+test("an absent card is simply empty", () => {
+  for (const input of [ undefined, null, "", "   " ]) {
+    assert.deepEqual(readStaticPrimitivesCard(input, quiet),
+                     { remotes: [], tools: [], prompts: [], resources: [] })
+  }
+})
+
+test("tools and prompts are identified by name, resources by uri", () => {
+  // Each primitive is dropped on the identifier its own protocol operation
+  // takes: tools/call and prompts/get take a name, resources/read takes a uri.
+  const card = readStaticPrimitivesCard(CARD({
+    tools: [ { name: "ok" }, { description: "no name" } ],
+    prompts: [ { name: "ok" }, { description: "no name" } ],
+    resources: [ { uri: "page:ok" }, { name: "no uri" } ]
+  }), quiet)
+
+  assert.deepEqual(card.tools.map((t) => t.name), [ "ok" ])
+  assert.deepEqual(card.prompts.map((p) => p.name), [ "ok" ])
+  assert.deepEqual(card.resources.map((r) => r.uri), [ "page:ok" ])
+})
+
+test("a dropped entry is reported, so a typo is visible", () => {
+  const said = []
+  readStaticPrimitivesCard(CARD({ tools: [ { description: "no name" } ] }), (...a) => said.push(a.join(" ")))
+
+  assert.ok(said.some((m) => /dropping a tool/.test(m)), said)
+})
+
+test("a non-array primitive list is tolerated", () => {
+  const card = readStaticPrimitivesCard(CARD({ tools: "nonsense", resources: 7 }), quiet)
+
+  assert.deepEqual(card, { remotes: [], tools: [], prompts: [], resources: [] })
+})
+
+// ---- page prompts -------------------------------------------------------
+//
+// prompts/get for a surface with no transport: the card carries the metadata,
+// a handler keyed by NAME returns the filled messages. Name, because that is
+// what prompts/get takes.
+test("a page prompt's handler supplies the messages", async () => {
+  const prompts = { annotate: () => ({ messages: [ { role: "user", content: { type: "text", text: "do it" } } ] }) }
+
+  const result = await getPagePrompt({ name: "annotate", prompts })
+
+  assert.equal(promptMessagesToText(result), "do it")
+})
+
+test("the handler is found by name, not by position", async () => {
+  // A one-entry map cannot tell a name lookup from "take the first one", and
+  // the identifier is the whole rule: prompts/get takes a name.
+  const prompts = { first: () => "wrong one", annotate: () => "right one" }
+
+  assert.equal(promptMessagesToText(await getPagePrompt({ name: "annotate", prompts })), "right one")
+})
+
+test("a plain string is accepted as well as the envelope", async () => {
+  // A page prompt is usually one block of text; making every host write the
+  // messages envelope by hand would be a tax with no benefit.
+  const prompts = { annotate: () => "just text" }
+
+  assert.equal(promptMessagesToText(await getPagePrompt({ name: "annotate", prompts })), "just text")
+})
+
+test("arguments reach the handler", async () => {
+  const seen = []
+  const prompts = { annotate: (args) => { seen.push(args); return "ok" } }
+
+  await getPagePrompt({ name: "annotate", args: { text: "carpal tunnel" }, prompts })
+
+  assert.deepEqual(seen, [ { text: "carpal tunnel" } ])
+})
+
+test("a handler is handed an object even when no arguments were filled", async () => {
+  const seen = []
+  const prompts = { annotate: (args) => { seen.push(args); return "ok" } }
+
+  await getPagePrompt({ name: "annotate", prompts })
+
+  assert.deepEqual(seen, [ {} ])
+})
+
+test("a declared prompt with no handler names itself in the error", async () => {
+  // The card and the handler map are edited separately, so a typo in either is
+  // the expected failure; the message has to say which name went unanswered.
+  await assert.rejects(
+    () => getPagePrompt({ name: "annotate", prompts: {} }),
+    (e) => /annotate/.test(e.message) && /no handler/.test(e.message)
+  )
+})
+
+test("an async handler is awaited", async () => {
+  const prompts = { annotate: async () => "from a promise" }
+
+  assert.equal(promptMessagesToText(await getPagePrompt({ name: "annotate", prompts })), "from a promise")
+})
+
+// ---- page resources -----------------------------------------------------
+//
+// resources/read for a surface with no transport: the card lists them, a
+// handler map keyed by URI reads them. A page declares SEVERAL — PD has six
+// readers — so unlike the hub's single reference resource these are planned
+// and rendered as a list.
+const pageEntry = (over = {}) => ({ uri: "page:text", name: "Text", description: "the text", ...over })
+
+test("every declared resource is planned, not just the first", () => {
+  const plans = planPageResources({
+    entries: [ pageEntry(), pageEntry({ uri: "page:dicts", name: "Dicts" }) ],
+    budgetBytes: 8000
+  })
+
+  assert.deepEqual(plans.map((p) => p.uri), [ "page:text", "page:dicts" ])
+})
+
+test("an over-budget resource is dropped before anything is read", () => {
+  const skipped = []
+  const plans = planPageResources({
+    entries: [ pageEntry({ size: 99999 }), pageEntry({ uri: "page:ok", size: 10 }) ],
+    budgetBytes: 8000,
+    onSkip: (p) => skipped.push(p.reason)
+  })
+
+  assert.deepEqual(plans.map((p) => p.uri), [ "page:ok" ])
+  assert.deepEqual(skipped, [ "over-budget" ])
+})
+
+test("autoAttach:false is honoured on a page entry", () => {
+  const plans = planPageResources({ entries: [ pageEntry({ autoAttach: false }) ], budgetBytes: 8000 })
+
+  assert.deepEqual(plans, [])
+})
+
+// A page card's entries sit INSIDE the extension block already, so these
+// fields are top-level there, while a server still puts them in _meta. One
+// planner serves both because resourceHints reads either.
+test("volatility is read from the entry itself, as a page card writes it", () => {
+  assert.equal(resourceHints({ uri: "x://y", volatility: "volatile" }).volatility, "volatile")
+})
+
+test("a volatile resource is re-read each turn, a stable one is cached", async () => {
+  const plans = planPageResources({
+    entries: [ pageEntry({ volatility: "volatile" }), pageEntry({ uri: "page:dicts", name: "Dicts" }) ],
+    budgetBytes: 8000
+  })
+  let reads = { "page:text": 0, "page:dicts": 0 }
+  const resources = {
+    "page:text": () => { reads["page:text"]++; return "text " + reads["page:text"] },
+    "page:dicts": () => { reads["page:dicts"]++; return "dicts" }
+  }
+
+  const t1 = await pageResourceLinesForTurn({ plans, resources, budgetBytes: 8000 })
+  const t2 = await pageResourceLinesForTurn({ plans, resources, budgetBytes: 8000, cache: t1.cache })
+
+  assert.match(t1.lines[0], /text 1/)
+  assert.match(t2.lines[0], /text 2/, "volatile must be re-read")
+  assert.equal(reads["page:dicts"], 1, "stable must be read once and cached")
+})
+
+test("a volatile resource is never served from a cache, even a seeded one", async () => {
+  // The write side already refuses to cache volatile entries, so the read-side
+  // check is unreachable through the normal flow — and it is the one that
+  // encodes the SEP's requirement ("SHOULD re-read it each time it attaches").
+  // Seeding the cache is how that guarantee gets tested rather than assumed.
+  const plans = planPageResources({ entries: [ pageEntry({ volatility: "volatile" }) ], budgetBytes: 8000 })
+  const resources = { "page:text": () => "fresh" }
+
+  const out = await pageResourceLinesForTurn({
+    plans, resources, budgetBytes: 8000, cache: { "page:text": "stale" }
+  })
+
+  assert.match(out.lines[0], /fresh/)
+  assert.doesNotMatch(out.lines[0], /stale/)
+})
+
+test("a resource is rendered with its description, one line each", () => {
+  assert.equal(pageResourceLine({ name: "Text", description: "the text" }, "hi"), "- Text (the text): hi")
+  assert.equal(pageResourceLine({ name: "Text", description: "" }, "hi"), "- Text: hi")
+})
+
+test("a non-string value is serialised", async () => {
+  const plans = planPageResources({ entries: [ pageEntry() ], budgetBytes: 8000 })
+  const out = await pageResourceLinesForTurn({ plans, resources: { "page:text": () => ({ a: 1 }) }, budgetBytes: 8000 })
+
+  assert.match(out.lines[0], /\{"a":1\}/)
+})
+
+test("a resource that declares no size is still trimmed to the budget", async () => {
+  // The gate can only drop what a page DECLARED as too big. A resource with no
+  // size sails through it, so the trim is the only thing standing between a
+  // runaway reader and the context window.
+  const plans = planPageResources({ entries: [ pageEntry() ], budgetBytes: 200 })
+  const huge = "x".repeat(5000)
+
+  const out = await pageResourceLinesForTurn({ plans, resources: { "page:text": () => huge }, budgetBytes: 200 })
+
+  assert.ok(out.lines[0].length < 1000, "an undeclared-size reader must not land whole: " + out.lines[0].length)
+})
+
+test("a declared resource with no handler is skipped, not fatal", async () => {
+  const plans = planPageResources({ entries: [ pageEntry() ], budgetBytes: 8000 })
+  const out = await pageResourceLinesForTurn({ plans, resources: {}, budgetBytes: 8000 })
+
+  assert.deepEqual(out.lines, [])
+})
+
+test("a reader that throws costs its own line, not the turn", async () => {
+  const plans = planPageResources({
+    entries: [ pageEntry(), pageEntry({ uri: "page:ok", name: "Ok" }) ], budgetBytes: 8000
+  })
+  const resources = { "page:text": () => { throw new Error("boom") }, "page:ok": () => "fine" }
+
+  const out = await pageResourceLinesForTurn({ plans, resources, budgetBytes: 8000 })
+
+  assert.deepEqual(out.lines, [ "- Ok (the text): fine" ])
+})
+
+test("an async reader is awaited", async () => {
+  const plans = planPageResources({ entries: [ pageEntry() ], budgetBytes: 8000 })
+  const out = await pageResourceLinesForTurn({ plans, resources: { "page:text": async () => "later" }, budgetBytes: 8000 })
+
+  assert.match(out.lines[0], /later/)
+})
+
+// --- prompt arguments on a card-only page ----------------------------------
+//
+// Arguments are declared by plain name; page resources are addressed by URI. A
+// page that moved its state into resources therefore had every prompt argument
+// arrive empty, and the visitor was asked to retype what was already on screen.
+
+const ARG_ENTRIES = [
+  { uri: "page:text", description: "the text to annotate" },
+  { uri: "page:selected_dictionaries", description: "chosen dictionaries" }
+]
+const ARG_RESOURCES = {
+  "page:text": () => "aspirin inhibits COX",
+  "page:selected_dictionaries": () => [ "MeSH", "DrugBank" ]
+}
+
+test("promptArgState fills an argument from the page resource of that name", () => {
+  const state = promptArgState({ entries: ARG_ENTRIES, resources: ARG_RESOURCES })
+
+  assert.equal(promptArgFromState("text", state), "aspirin inhibits COX")
+})
+
+test("promptArgState resolves an aliased argument through the resource", () => {
+  const state = promptArgState({ entries: ARG_ENTRIES, resources: ARG_RESOURCES })
+
+  assert.equal(promptArgFromState("dictionaries", state), "MeSH,DrugBank")
+})
+
+test("a declared resource with no reader supplies no argument", () => {
+  const state = promptArgState({ entries: ARG_ENTRIES, resources: {} })
+
+  assert.equal(promptArgFromState("text", state), "")
+})
+
+test("an explicit aiState entry wins over the page resource of the same name", () => {
+  const state = promptArgState({
+    entries: ARG_ENTRIES,
+    resources: ARG_RESOURCES,
+    state: { text: { description: "declared directly", read: () => "from aiState" } }
+  })
+
+  assert.equal(promptArgFromState("text", state), "from aiState")
+})
+
+test("a resource addressed by another scheme does not become an argument", () => {
+  // `data:` is the same length as `page:`, so slicing the prefix off it yields
+  // exactly the argument name. Only the scheme check can tell these apart — a
+  // longer scheme such as https:// would be mangled by the slice and the test
+  // would pass with the check removed, proving nothing.
+  const state = promptArgState({
+    entries: [ { uri: "data:text", description: "elsewhere" } ],
+    resources: { "data:text": () => "remote" }
+  })
+
+  assert.equal(promptArgFromState("text", state), "")
+})
+
+test("a required argument a page resource fills is not reported missing", () => {
+  const state = promptArgState({ entries: ARG_ENTRIES, resources: ARG_RESOURCES })
+  const resolved = resolvePromptArguments({ arguments: [ { name: "text", required: true } ] }, state)
+
+  assert.deepEqual(resolved.missing, [])
+  assert.equal(resolved.args.text, "aspirin inhibits COX")
+})
+
+test("the argument summary shows a resource-filled slot as filled", () => {
+  const state = promptArgState({ entries: ARG_ENTRIES, resources: ARG_RESOURCES })
+
+  assert.equal(promptArgumentSummary({ arguments: [ { name: "text" } ] }, state)[0].filled, true)
+})
+
+test("promptArgState called with nothing is harmless", () => {
+  assert.equal(promptArgFromState("text", promptArgState()), "")
+})
+
+// --- merging several cards from one document -------------------------------
+
+test("cards from several blocks concatenate by primitive type", () => {
+  const merged = mergeStaticPrimitivesCards([
+    { tools: [ { name: "a" } ], prompts: [], resources: [ { uri: "page:x" } ] },
+    { tools: [ { name: "b" } ], prompts: [ { name: "p" } ], resources: [] }
+  ], () => {})
+
+  assert.deepEqual(merged.tools.map((t) => t.name), [ "a", "b" ])
+  assert.deepEqual(merged.prompts.map((p) => p.name), [ "p" ])
+  assert.deepEqual(merged.resources.map((r) => r.uri), [ "page:x" ])
+})
+
+test("a duplicate name drops every copy and reports it", () => {
+  const said = []
+  const merged = mergeStaticPrimitivesCards([
+    { tools: [ { name: "clash", description: "one" }, { name: "kept" } ] },
+    { tools: [ { name: "clash", description: "two" } ] }
+  ], (m) => said.push(m))
+
+  assert.deepEqual(merged.tools.map((t) => t.name), [ "kept" ],
+                   "neither copy may be picked — DOM order is not an authoring decision")
+  assert.equal(said.length, 1)
+  assert.match(said[0], /clash/)
+})
+
+test("a duplicate resource is keyed by uri, not by name", () => {
+  // Two resources may legitimately share a display name; the uri is the
+  // identifier resources/read takes, so only a uri clash is a duplicate.
+  const merged = mergeStaticPrimitivesCards([
+    { resources: [ { uri: "page:a", name: "Same label" } ] },
+    { resources: [ { uri: "page:b", name: "Same label" } ] }
+  ], () => {})
+
+  assert.deepEqual(merged.resources.map((r) => r.uri), [ "page:a", "page:b" ])
+})
+
+test("a tool and a prompt may share a name", () => {
+  // Different primitive types are different namespaces: tools/call and
+  // prompts/get never consult the same map.
+  const merged = mergeStaticPrimitivesCards([
+    { tools: [ { name: "annotate" } ], prompts: [ { name: "annotate" } ] }
+  ], () => {})
+
+  assert.equal(merged.tools.length, 1)
+  assert.equal(merged.prompts.length, 1)
+})
+
+test("merging nothing yields empty arrays, not undefined", () => {
+  const merged = mergeStaticPrimitivesCards(undefined, () => {})
+
+  assert.deepEqual(merged, { remotes: [], tools: [], prompts: [], resources: [] })
+})
+
+test("the media type is the one the spec names", () => {
+  assert.equal(PAGE_CARD_MEDIA_TYPE, "application/mcp-static-primitives+json")
+})
+
+// --- the page-local transport (SEP-0000 "page-global") -------------------
+//
+// A Server Card states its endpoint; a page card states the global under which
+// its handlers live. Without it the three legacy names are a private contract
+// between the page and this widget, and they are configurable per page, so no
+// outside consumer could rely on them.
+
+const CARD_WITH_GLOBAL = { remotes: [ { type: "page-global", global: "mcp" } ] }
+
+test("declaredPageGlobal reads the global the card declares", () => {
+  assert.equal(declaredPageGlobal(CARD_WITH_GLOBAL), "mcp")
+})
+
+test("declaredPageGlobal ignores a transport of another type", () => {
+  // The discriminating case is a transport that ALSO names a global, which is
+  // what the spec reserves `page-jsonrpc` for: a single JSON-RPC responder
+  // rather than three handler maps. Dispatching maps against it would be
+  // wrong, so the type check has to be what rejects it — not the absence of a
+  // `global` field, which is all a streamable-http entry would have proved.
+  assert.equal(declaredPageGlobal({ remotes: [ { type: "page-jsonrpc", global: "mcp" } ] }), null)
+  assert.equal(declaredPageGlobal({ remotes: [ { type: "streamable-http", url: "https://x/mcp" } ] }), null)
+})
+
+test("declaredPageGlobal ignores a blank or missing global name", () => {
+  assert.equal(declaredPageGlobal({ remotes: [ { type: "page-global", global: "  " } ] }), null)
+  assert.equal(declaredPageGlobal({ remotes: [ { type: "page-global" } ] }), null)
+  assert.equal(declaredPageGlobal({}), null)
+  assert.equal(declaredPageGlobal(), null)
+})
+
+test("the declared global supplies all three handler maps", () => {
+  const scope = { mcp: { tools: { t: 1 }, prompts: { p: 2 }, resources: { "page:r": 3 } } }
+  const h = pageHandlers({ card: CARD_WITH_GLOBAL, scope,
+                           legacy: { tools: "aiActions", prompts: "aiPrompts", resources: "aiResources" } })
+
+  assert.deepEqual([ h.tools, h.prompts, h.resources ],
+                   [ { t: 1 }, { p: 2 }, { "page:r": 3 } ])
+  assert.equal(h.global, "mcp")
+})
+
+test("the declared global wins over the legacy globals", () => {
+  const scope = { mcp: { tools: { fromGlobal: 1 } }, aiActions: { fromLegacy: 1 } }
+  const h = pageHandlers({ card: CARD_WITH_GLOBAL, scope, legacy: { tools: "aiActions" } })
+
+  assert.deepEqual(h.tools, { fromGlobal: 1 })
+})
+
+test("each map falls back on its own, so a part-moved page keeps working", () => {
+  // tools moved into window.mcp; prompts and resources have not.
+  const scope = { mcp: { tools: { moved: 1 } },
+                  aiPrompts: { stayed: 2 }, aiResources: { "page:x": 3 } }
+  const h = pageHandlers({ card: CARD_WITH_GLOBAL, scope,
+                           legacy: { tools: "aiActions", prompts: "aiPrompts", resources: "aiResources" } })
+
+  assert.deepEqual(h.tools, { moved: 1 })
+  assert.deepEqual(h.prompts, { stayed: 2 })
+  assert.deepEqual(h.resources, { "page:x": 3 })
+})
+
+test("a page that declares no transport uses the legacy globals", () => {
+  const scope = { aiActions: { a: 1 }, aiPrompts: { b: 2 }, aiResources: { c: 3 } }
+  const h = pageHandlers({ card: { remotes: [] }, scope,
+                           legacy: { tools: "aiActions", prompts: "aiPrompts", resources: "aiResources" } })
+
+  assert.deepEqual([ h.tools, h.prompts, h.resources ], [ { a: 1 }, { b: 2 }, { c: 3 } ])
+  assert.equal(h.global, null)
+})
+
+test("a declared global that does not exist falls back rather than throwing", () => {
+  const h = pageHandlers({ card: CARD_WITH_GLOBAL, scope: { aiActions: { a: 1 } },
+                           legacy: { tools: "aiActions" } })
+
+  assert.deepEqual(h.tools, { a: 1 })
+})
+
+test("pageHandlers called with nothing yields empty maps", () => {
+  const h = pageHandlers()
+
+  assert.deepEqual([ h.tools, h.prompts, h.resources ], [ {}, {}, {} ])
+})
+
+test("a card's declared transport survives the parse", () => {
+  const card = readStaticPrimitivesCard(JSON.stringify({
+    name: "org.example/page",
+    remotes: [ { type: "page-global", global: "mcp" } ],
+    _meta: { "io.modelcontextprotocol/static-primitives": { tools: [ { name: "t" } ] } }
+  }), () => {})
+
+  assert.equal(declaredPageGlobal(card), "mcp")
+})
+
+test("two blocks declaring different globals keep the first and report it", () => {
+  const said = []
+  const merged = mergeStaticPrimitivesCards([
+    { remotes: [ { type: "page-global", global: "first" } ] },
+    { remotes: [ { type: "page-global", global: "second" } ] }
+  ], (m) => said.push(m))
+
+  assert.equal(declaredPageGlobal(merged), "first")
+  assert.equal(said.length, 1)
+  assert.match(said[0], /second/)
+})
+
+test("a declared map given as an array is rejected and reported", () => {
+  // An array passes a typeof check, so without this it would be used as a map
+  // and answer every lookup with undefined — the page's tools silently gone.
+  const said = []
+  const h = pageHandlers({
+    card: CARD_WITH_GLOBAL,
+    scope: { mcp: { tools: [] }, aiActions: { legacy: 1 } },
+    legacy: { tools: "aiActions" },
+    warn: (m) => said.push(m)
+  })
+
+  assert.deepEqual(h.tools, { legacy: 1 })
+  assert.match(said.join(" "), /array/)
+})
+
+test("a declared global the page never defines is reported", () => {
+  // Nearly always load order, or a script that threw before defining it — the
+  // failure we hit for real on 2026-10-15 was exactly that shape.
+  const said = []
+  pageHandlers({ card: CARD_WITH_GLOBAL, scope: {}, legacy: { tools: "aiActions" },
+                 warn: (m) => said.push(m) })
+
+  assert.equal(said.length, 1)
+  assert.match(said[0], /window\.mcp is not defined/)
+})
+
+test("a page that declares no transport is not warned about", () => {
+  const said = []
+  pageHandlers({ card: { remotes: [] }, scope: { aiActions: {} },
+                 legacy: { tools: "aiActions" }, warn: (m) => said.push(m) })
+
+  assert.deepEqual(said, [])
+})
+
+// --- budgeting against the model's real window --------------------------
+//
+// A TogoMCP session reached 157,358 tokens against a 131,072-token model: its
+// usage guide alone is 71 KB (~18k tokens) in one tool result, and the loop
+// capped nothing. The hub now refuses such a turn with a clear message; this
+// is the other half, so a long tool-heavy turn degrades instead of ending.
+
+test("modelWindowFrom reads the window of the configured model", () => {
+  const payload = { llms: [
+    { family: "ollama", available_models: [ { value: "local-1", max_input_tokens: 32768 } ] },
+    { family: "bedrock", models: [ { name: "gpt-oss-120b", max_input_tokens: 128000 } ] }
+  ] }
+
+  assert.equal(modelWindowFrom(payload, "gpt-oss-120b"), 128000)
+  assert.equal(modelWindowFrom(payload, "local-1"), 32768)
+})
+
+test("modelWindowFrom looks past the family the picker shows", () => {
+  // The picker lists only the ollama family, while the configured model is
+  // usually hosted — so a scan of that family alone would always find nothing.
+  const payload = { llms: [ { family: "bedrock", models: [ { name: "m", max_input_tokens: 99 } ] } ] }
+
+  assert.equal(modelWindowFrom(payload, "m"), 99)
+})
+
+test("modelWindowFrom says null when the hub does not know", () => {
+  assert.equal(modelWindowFrom({ llms: [ { family: "x", models: [ { name: "m" } ] } ] }, "m"), null)
+  assert.equal(modelWindowFrom({ llms: [ { family: "x", models: [ { name: "m", max_input_tokens: 0 } ] } ] }, "m"), null)
+  assert.equal(modelWindowFrom({}, "m"), null)
+  assert.equal(modelWindowFrom(undefined, "m"), null)
+})
+
+test("estimateTokens counts content and a cost per message", () => {
+  // "x" is a letter, so this is the prose class: 400 / 3.5.
+  const one = estimateTokens([ { role: "user", content: "x".repeat(400) } ])
+
+  assert.equal(one, Math.ceil(400 / 3.5) + 4)
+  assert.equal(estimateTokens([]), 0)
+})
+
+test("a tool result costs far more per character than prose", () => {
+  // The failure this exists to prevent (2026-10-17): a 289,101-character
+  // request that the provider counted as 135,291 tokens — 2.14 characters per
+  // token — was estimated at 72,275 by a flat four-per-token rule, so nothing
+  // was evicted and the provider refused the turn.
+  const prose = "the quick brown fox jumps over the lazy dog ".repeat(100)
+  const json  = '{"rsID":"rs28929474","pos":94378610,"ref":"C","alt":"T","af":0.0047},'.repeat(64)
+
+  const proseRatio = prose.length / estimateTextTokens(prose)
+  const jsonRatio  = json.length / estimateTextTokens(json)
+
+  assert.ok(proseRatio > 3, `prose should be ~3.5 chars/token, got ${proseRatio.toFixed(2)}`)
+  assert.ok(jsonRatio < 2.2, `a tool result should be under ~2.2 chars/token, got ${jsonRatio.toFixed(2)}`)
+})
+
+test("the estimate of a real refused request is at or above its true size", () => {
+  // Rebuilt to the measured composition of that request: 33% letters,
+  // 6% spaces, 16% digits, 45% punctuation, 289,101 characters, which the
+  // provider counted as 135,291 tokens. Anything BELOW that is the bug
+  // returning; a little above is the intended safety margin.
+  const unit = "abcdefghijklmnopqrstuvwxyzabcdefg" +   // 33 letters
+               "      " +                              //  6 spaces
+               "0123456789012345" +                    // 16 digits
+               '{"":,}[]()<>-_.:;/|@#$%^&*+=~?!\'\\`' +
+               '{}[](),.:;"' // 45 punctuation in all: the unit is 100 chars
+  const sample = unit.repeat(Math.ceil(289_101 / unit.length)).slice(0, 289_101)
+
+  // The fixture is only worth anything if it still looks like that request.
+  const letters = (sample.match(/[A-Za-z]/g) || []).length
+  const digits  = (sample.match(/[0-9]/g) || []).length
+  assert.ok(Math.abs(letters / sample.length - 0.33) < 0.04, "letters should be ~33%")
+  assert.ok(Math.abs(digits / sample.length - 0.16) < 0.04, "digits should be ~16%")
+
+  const estimate = estimateTextTokens(sample)
+
+  assert.ok(estimate >= 135_291, `must not underestimate: got ${estimate}`)
+  assert.ok(estimate <= 135_291 * 1.3, `and must not wildly overestimate: got ${estimate}`)
+})
+
+test("estimateTokens handles a non-string content without throwing", () => {
+  assert.ok(estimateTokens([ { role: "tool", content: { a: 1 } } ]) > 0)
+})
+
+test("eviction drops the oldest tool result and leaves the rest alone", () => {
+  const messages = [
+    { role: "system", content: "rules" },
+    { role: "user", content: "question" },
+    { role: "tool", tool_call_id: "c1", name: "old_tool", content: "x".repeat(400_000) },
+    { role: "assistant", content: "what I made of it" },
+    { role: "tool", tool_call_id: "c2", name: "new_tool", content: "y".repeat(400_000) }
+  ]
+
+  const { messages: out, dropped } = evictOldToolResults({ messages, window: 128_000, reserve: 2048 })
+
+  assert.match(out[2].content, /dropped to make room/)
+  assert.equal(out[4].content.length, 400_000, "the newest result is kept")
+  assert.deepEqual(dropped.map((d) => d.name), [ "old_tool" ])
+  assert.equal(out[0].content, "rules", "the system prompt is untouched")
+  assert.equal(out[1].content, "question", "the question is untouched")
+  assert.equal(out[3].content, "what I made of it", "the model's own summary survives")
+})
+
+test("an evicted result keeps its tool_call_id, because a call needs an answer", () => {
+  // A provider that sees a tool_call with no matching result rejects the whole
+  // request, so eviction replaces the content and never removes the message.
+  const messages = [
+    { role: "tool", tool_call_id: "c1", name: "t", content: "x".repeat(900_000) },
+    { role: "user", content: "go" }
+  ]
+
+  const { messages: out } = evictOldToolResults({ messages, window: 1000, reserve: 0 })
+
+  assert.equal(out.length, 2)
+  assert.equal(out[0].tool_call_id, "c1")
+  assert.equal(out[0].role, "tool")
+})
+
+test("eviction stops as soon as the request fits", () => {
+  const big = () => ({ role: "tool", tool_call_id: "c", name: "t", content: "x".repeat(40_000) })
+  const messages = [ big(), big(), big(), { role: "user", content: "go" } ]
+
+  // 3 x ~10k tokens against a 25k budget: shedding the first ~10k is already
+  // enough, so the second and third must survive. The cheap implementation —
+  // drop every tool result whenever the turn is too big — passes a "does it
+  // fit now" test and fails this one.
+  const { messages: out, dropped } = evictOldToolResults({ messages, window: 25_000, reserve: 0 })
+
+  assert.equal(dropped.length, 1)
+  assert.equal(out[1].content.length, 40_000)
+  assert.equal(out[2].content.length, 40_000)
+})
+
+test("nothing is evicted when the turn already fits", () => {
+  const messages = [ { role: "tool", tool_call_id: "c", name: "t", content: "small" } ]
+  const { messages: out, dropped } = evictOldToolResults({ messages, window: 128_000 })
+
+  assert.equal(out, messages, "the same array, so the caller can tell nothing happened")
+  assert.deepEqual(dropped, [])
+})
+
+test("nothing is evicted when the window is unknown", () => {
+  // Guessing a window is worse than not budgeting: too low throws away context
+  // the turn needed, too high fails at the provider anyway.
+  const messages = [ { role: "tool", tool_call_id: "c", name: "t", content: "x".repeat(900_000) } ]
+
+  assert.equal(evictOldToolResults({ messages, window: null }).messages, messages)
+  assert.equal(evictOldToolResults({ messages, window: 0 }).messages, messages)
+})
+
+test("an already-dropped result is not dropped again", () => {
+  const messages = [
+    { role: "tool", tool_call_id: "c1", name: "t", content: "[dropped to make room in the context window.]" },
+    { role: "tool", tool_call_id: "c2", name: "t2", content: "x".repeat(400_000) }
+  ]
+
+  const { dropped } = evictOldToolResults({ messages, window: 1000, reserve: 0 })
+
+  assert.deepEqual(dropped.map((d) => d.name), [ "t2" ])
+})
+
+test("room is kept for the answer, not just for the request", () => {
+  // ~7k tokens against a 10k window fits — and leaves 3k to generate into,
+  // which a long answer overruns. The reserve is what makes this evict, so a
+  // budget of `window` alone passes every other test here and fails this one.
+  const messages = [
+    { role: "tool", tool_call_id: "c1", name: "old", content: "x".repeat(20_000) },
+    { role: "user", content: "go" }
+  ]
+
+  const fits = evictOldToolResults({ messages, window: 10_000, reserve: 0 })
+  assert.deepEqual(fits.dropped, [], "no reserve, no need to drop anything")
+
+  const reserved = evictOldToolResults({ messages, window: 10_000, reserve: 5_000 })
+  assert.deepEqual(reserved.dropped.map((d) => d.name), [ "old" ])
+})
+
+test("the resource budget is the old constant at the window it was chosen for", () => {
+  // 8000 bytes was picked as "~2k tokens on a 32k local model". If the share
+  // is ever retuned, this says what the old behaviour was.
+  assert.equal(resourceBudgetBytes(32_768), 8192)
+})
+
+test("a bigger model may attach more of its reference material", () => {
+  assert.equal(resourceBudgetBytes(128_000), 32_000)
+})
+
+test("the budget never drops below the old fixed value", () => {
+  // A small window must not make the widget attach less than it always did:
+  // below the floor a resource stops being useful at all.
+  assert.equal(resourceBudgetBytes(8_000), 8000)
+  assert.equal(resourceBudgetBytes(null), 8000)
+  assert.equal(resourceBudgetBytes(undefined), 8000)
+})
+
+test("the budget is capped, because these bytes are fetched every turn", () => {
+  // The largest real catalog is ~35 KB, so a 1M-token model gains nothing from
+  // a 250 KB allowance.
+  assert.equal(resourceBudgetBytes(1_000_000), 64_000)
+})
+
+test("runChatLoop applies the window to the messages it sends", async () => {
+  // Drives the loop itself, not just the pure helper: an earlier tool result
+  // of ~4000 tokens against a 3000-token model must not be sent whole.
+  const history = { role: "tool", tool_call_id: "c0", name: "earlier", content: "z".repeat(16_000) }
+  const { calls } = await withFetch(
+    [ { matches: (u) => u.includes("/single_llm_calls"), respond: () => sseResponse(sseDoneOnly("ok")) } ],
+    () => runChatLoop({ ...BASE_OPTS, contextWindow: 3_000,
+                        messages: [ history, { role: "user", content: "hi" } ] })
+  )
+
+  const sent = calls[0].body.messages.filter((m) => m.role === "tool")
+  assert.match(sent[0].content, /dropped to make room/)
+  assert.equal(calls[0].body.messages.find((m) => m.role === "user").content, "hi", "the question stays")
+})
+
+test("runChatLoop does no budgeting at all when no window is given", async () => {
+  // Asserts the DEFAULT, which no fixture can do by size alone: a loop whose
+  // default window were some large number would still send a big turn whole,
+  // and look identical. So count the work instead — estimating a turn reads
+  // every message's content, and a loop with no window must not estimate.
+  //
+  // Both runs serialise the same body for the request, so the difference in
+  // reads is the estimation and nothing else.
+  const spyMessages = () => {
+    const state = { reads: 0 }
+    const msg = { role: "tool", tool_call_id: "c0", name: "earlier",
+                  get content() { state.reads++; return "z".repeat(4_000) } }
+    return [ state, [ msg, { role: "user", content: "hi" } ] ]
+  }
+  const route = [ { matches: (u) => u.includes("/single_llm_calls"), respond: () => sseResponse(sseDoneOnly("ok")) } ]
+
+  const [ without, msgsA ] = spyMessages()
+  await withFetch(route, () => runChatLoop({ ...BASE_OPTS, messages: msgsA }))
+
+  const [ withWindow, msgsB ] = spyMessages()
+  await withFetch(route, () => runChatLoop({ ...BASE_OPTS, contextWindow: 10_000, messages: msgsB }))
+
+  assert.ok(withWindow.reads > without.reads,
+    "a loop given a window must estimate the turn; one given none must not")
+})
+
+test("runChatLoop with no window given evicts nothing, however long the turn", async () => {
+  // The default must be "no window", not a large invented one: a host that
+  // embeds the loop directly and never passes contextWindow would otherwise
+  // have its context silently thinned.
+  const huge = { role: "tool", tool_call_id: "c0", name: "earlier", content: "z".repeat(4_000_000) }
+  const { calls } = await withFetch(
+    [ { matches: (u) => u.includes("/single_llm_calls"), respond: () => sseResponse(sseDoneOnly("ok")) } ],
+    () => runChatLoop({ ...BASE_OPTS, messages: [ huge, { role: "user", content: "hi" } ] })
+  )
+
+  const sent = calls[0].body.messages.filter((m) => m.role === "tool")
+  assert.equal(sent[0].content.length, 4_000_000, "nothing may be dropped without a window")
+})
+
+test("runChatLoop holds tokens back for the answer by default", () => {
+  // Several results, none of them over the per-result cap, so this is an
+  // AGGREGATE overflow — the case eviction is for, now that one oversized
+  // result is capped instead. ~3,400 tokens of history against a 4,600-token
+  // window: it fits the window, and does not fit once room is kept for the
+  // answer.
+  const some = (id) => ({ role: "tool", tool_call_id: id, name: "earlier", content: "z".repeat(4_000) })
+  const messages = [ some("c1"), some("c2"), some("c3"), { role: "user", content: "hi" } ]
+
+  const fits = evictOldToolResults({ messages, window: 4_600, reserve: 0 })
+  assert.deepEqual(fits.dropped, [], "no reserve, nothing needs to go")
+
+  const reserved = evictOldToolResults({ messages, window: 4_600, reserve: 2_048 })
+  assert.ok(reserved.dropped.length > 0, "the reserve is what makes this evict")
+})
+
+test("estimateToolsTokens prices names, descriptions and schemas", () => {
+  const tools = [ { name: "a", description: "d".repeat(400), input_schema: { type: "object" } } ]
+
+  assert.ok(estimateToolsTokens(tools) > 100, "a 400-character description is ~100 tokens")
+  assert.equal(estimateToolsTokens([]), 0)
+  assert.equal(estimateToolsTokens(undefined), 0)
+})
+
+test("a tool schema is priced as JSON, not as prose", () => {
+  // A schema is punctuation and short keys — the dense case. Pricing it as
+  // prose understates what every turn carries before a word is said: TogoMCP
+  // declares around twenty of these.
+  const schema = { type: "object", properties: {
+    query: { type: "string", description: "x" },
+    limit: { type: "integer", minimum: 1, maximum: 100 },
+    fields: { type: "array", items: { type: "string" } }
+  }, required: [ "query" ] }
+  const tools = [ { name: "s", description: "", input_schema: schema } ]
+  const serialised = JSON.stringify({ name: "s", description: "", schema })
+
+  const tokens = estimateToolsTokens(tools)
+
+  assert.ok(tokens > Math.ceil(serialised.length / 3),
+    `a schema should cost more than a flat prose rate: ${tokens} for ${serialised.length} chars`)
+})
+
+test("estimateToolsTokens reads either spelling of the schema field", () => {
+  // The wire uses input_schema; a page card and the MCP spec use inputSchema.
+  const snake = estimateToolsTokens([ { name: "a", input_schema: { x: "y".repeat(200) } } ])
+  const camel = estimateToolsTokens([ { name: "a", inputSchema: { x: "y".repeat(200) } } ])
+
+  assert.equal(snake, camel)
+  assert.ok(snake > 40)
+})
+
+test("runChatLoop counts the declared tools against the window", async () => {
+  // The messages alone fit the window; the tool schemas are what overrun it.
+  // A budget that counts only messages sends this turn whole and the provider
+  // refuses it — which is the failure this whole change exists to prevent.
+  // ~5,000 tokens of messages and ~5,250 of tool schemas. The messages alone
+  // fit a 9,000-token window; together they do not.
+  const history = { role: "tool", tool_call_id: "c0", name: "earlier", content: "z".repeat(20_000) }
+  const fatTools = Array.from({ length: 20 }, (_, i) => ({
+    name: "tool_" + i, description: "d".repeat(1_000), input_schema: { type: "object" }
+  }))
+  const { calls } = await withFetch(
+    [ { matches: (u) => u.includes("/single_llm_calls"), respond: () => sseResponse(sseDoneOnly("ok")) } ],
+    () => runChatLoop({ ...BASE_OPTS, contextWindow: 9_000, outputReserve: 0,
+                        messages: [ history, { role: "user", content: "hi" } ],
+                        remoteTools: fatTools })
+  )
+
+  const sent = calls[0].body.messages.filter((m) => m.role === "tool")
+  assert.match(sent[0].content, /dropped to make room/,
+    "5,000 tokens of messages plus 5,250 of tool schemas does not fit 9,000")
+})
+
+// --- capping one oversized tool result ----------------------------------
+
+test("a result over the share is cut to about the cap, keeping its identity", () => {
+  // A provider rejects a tool_call with no matching result, so the message
+  // must survive with its id — only its content shrinks.
+  const messages = [ { role: "tool", tool_call_id: "c1", name: "big", content: "z".repeat(400_000) },
+                     { role: "user", content: "go" } ]
+
+  const { messages: out, truncated } = truncateOversizedToolResults({ messages, window: 100_000 })
+
+  assert.equal(out[0].role, "tool")
+  assert.equal(out[0].tool_call_id, "c1")
+  assert.match(out[0].content, /truncated: \d+ of 400000 characters shown/)
+  assert.match(out[0].content, /at most 40% of the context window/)
+  const after = estimateTextTokens(out[0].content)
+  assert.ok(after <= 100_000 * 0.4 * 1.1, `should land near the cap, got ${after}`)
+  assert.deepEqual(truncated.map((t) => t.name), [ "big" ])
+})
+
+test("a result within the share is left exactly alone", () => {
+  const messages = [ { role: "tool", tool_call_id: "c1", name: "ok", content: "z".repeat(1_000) } ]
+  const { messages: out, truncated } = truncateOversizedToolResults({ messages, window: 100_000 })
+
+  assert.equal(out, messages, "the same array, so the caller can tell nothing happened")
+  assert.deepEqual(truncated, [])
+})
+
+test("nothing is cut when the window is unknown", () => {
+  const messages = [ { role: "tool", tool_call_id: "c1", name: "big", content: "z".repeat(900_000) } ]
+
+  assert.equal(truncateOversizedToolResults({ messages, window: null }).messages, messages)
+  assert.equal(truncateOversizedToolResults({ messages, window: 0 }).messages, messages)
+})
+
+test("capping one result spares the others, which eviction would have dropped", () => {
+  // The audited turn (2026-10-17): two 80-token results and one of 120,667
+  // against a 128,000 window. Eviction dropped the two small ones — 160 tokens
+  // against a ~2,600 shortfall — and left the monster. Capping frees ~69,000
+  // and keeps everything the model asked for.
+  const small = (id, name) => ({ role: "tool", tool_call_id: id, name, content: "x".repeat(220) })
+  const messages = [
+    { role: "system", content: "rules" },
+    small("c1", "find_ids"),
+    small("c2", "list_dictionaries"),
+    { role: "tool", tool_call_id: "c3", name: "togovar_search_variant", content: "z".repeat(242_795) }
+  ]
+
+  const capped = truncateOversizedToolResults({ messages, window: 128_000 })
+  const { dropped } = evictOldToolResults({ messages: capped.messages, window: 128_000, reserve: 8_048 })
+
+  assert.deepEqual(capped.truncated.map((t) => t.name), [ "togovar_search_variant" ])
+  assert.deepEqual(dropped, [], "with the monster capped, nothing needs dropping")
+  assert.equal(capped.messages[1].content.length, 220, "the small results are untouched")
+  assert.equal(capped.messages[2].content.length, 220)
 })
