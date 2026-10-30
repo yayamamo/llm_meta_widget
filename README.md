@@ -61,7 +61,7 @@ Option 3 if it does not.
 
 ```ruby
 # Gemfile
-gem "llm_meta_widget", "~> 0.12.2"
+gem "llm_meta_widget", "~> 0.15.2"
 ```
 
 ```bash
@@ -152,22 +152,25 @@ The widget is a custom element in a single self-contained ES module, so the
 whole integration is two lines of HTML:
 
 ```html
-<script type="module" src="https://cdn.jsdelivr.net/npm/@aibranch/llm-meta-widget@0.12"></script>
+<script type="module" src="https://cdn.jsdelivr.net/npm/@aibranch/llm-meta-widget@0.15"></script>
 <llm-meta-widget llm-url="https://your-meta-server.example"
                  model="gpt-oss-120b"
                  greeting="Hi — ask me anything about this page."></llm-meta-widget>
 ```
 
-**`@0.12` is a version range, and it stops at 0.12.x on purpose.** You receive
+**`@0.15` is a version range, and it stops at 0.15.x on purpose.** You receive
 bug fixes without editing your page, and a release that breaks your page cannot
 arrive on its own.
 
-Moving to 0.13 is therefore a change you make yourself. Read
+Moving to 0.16 is therefore a change you make yourself. Read
 [CHANGELOG.md](CHANGELOG.md) before you do, because this is where what your page
 must provide can change. For example, 0.10.0 changed how the widget finds a page
 card: by media type rather than by element id. A page that declared its card the
 new way while still loading `@0.9` lost every tool, prompt and resource it had
 declared. Nothing failed, anywhere. The CHANGELOG entry for 0.10.0 describes it.
+
+0.13.0 moved where a page declares its transport, and 0.14.0 stopped reading
+the old spelling. Move your card to `transports` before taking 0.14.x.
 
 A Rails app is protected from that mismatch, because the `Gemfile` will not
 resolve a widget version the page cannot use. A page that loads the widget from
@@ -359,8 +362,8 @@ primitive type:
 <script type="application/mcp-static-primitives+json">
 {
   "name": "org.example/your-page",
-  "remotes": [ { "type": "page-global", "global": "mcp" } ],
   "_meta": { "io.modelcontextprotocol/static-primitives": {
+    "transports": [ { "type": "page-global", "global": "mcp" } ],
     "tools": [
       { "name": "add_dictionaries",
         "description": "Add the named dictionaries to the current selection.",
@@ -392,10 +395,17 @@ primitive type:
 A tool's schema may be spelled `inputSchema`, as MCP spells it, or
 `input_schema`. Both are accepted.
 
-`remotes` is how a consumer other than this widget finds your handlers, so the
-global is declared rather than assumed. Leave it out and the widget reads
+`transports` is how a consumer other than this widget finds your handlers, so
+the global is declared rather than assumed. It is a list, and the consumer uses
+the first entry whose `type` it supports; `page-global` is the only type this
+widget supports today. Leave `transports` out and the widget reads
 `window.aiActions`, `window.aiPrompts` and `window.aiResources` instead — see
 "Say where your handlers live".
+
+Widgets from 0.11.1 to 0.12.2 read this declaration from a `remotes` list at the
+top level of the card, and 0.13.x read either spelling. From 0.14.0 the old one
+is not read at all: a card that still carries it gets no handlers, and the
+widget reports that in the browser console. Write `transports`.
 
 A page may declare `prompts` in the same block. See [The page card](#the-page-card)
 for prompts, for the size and volatility hints on a resource, and for what
@@ -602,8 +612,8 @@ name the global that holds its handlers. Both are below.
 <script type="application/mcp-static-primitives+json">
 {
   "name": "org.example/your-page",
-  "remotes": [ { "type": "page-global", "global": "mcp" } ],
   "_meta": { "io.modelcontextprotocol/static-primitives": {
+    "transports": [ { "type": "page-global", "global": "mcp" } ],
     "tools":     [ { "name": "set_text", "description": "…", "inputSchema": { } } ],
     "prompts":   [ { "name": "annotate", "description": "Annotate this page" } ],
     "resources": [ { "uri": "page:text", "name": "Text", "description": "the text to annotate",
@@ -613,8 +623,8 @@ name the global that holds its handlers. Both are below.
 </script>
 ```
 
-`name` identifies the card, as it does for a server. `remotes` says where the
-handlers live — see "Say where your handlers live" below. Only the `_meta`
+`name` identifies the card, as it does for a server. `transports` says where
+the handlers live — see "Say where your handlers live" below. Only the `_meta`
 block is required by this widget; the rest is what makes the card readable by
 anything else.
 
@@ -660,8 +670,8 @@ them:
 ```html
 <script type="application/mcp-static-primitives+json">
 { "name": "org.example/your-page",
-  "remotes": [ { "type": "page-global", "global": "mcp" } ],
-  "_meta": { "io.modelcontextprotocol/static-primitives": { "tools": [ ... ] } } }
+  "_meta": { "io.modelcontextprotocol/static-primitives": {
+    "transports": [ { "type": "page-global", "global": "mcp" } ], "tools": [ ... ] } } }
 </script>
 <script>
   window.mcp = {
@@ -682,6 +692,18 @@ only to this widget, and they can be renamed per page with the options below,
 so no other consumer can rely on them. Each kind falls back on its own, so you
 can move tools into the declared global and leave prompts and resources where
 they are.
+
+**Script order does not matter.** The widget looks up your global at the moment
+it needs a handler, not when it reads the card. The script that defines
+`window.mcp` may therefore run before or after the widget loads: a `defer`
+attribute, an ES module, or a `<script>` near the end of the page are all fine.
+If a handler is wanted while the global is still undefined, the widget says so
+in the browser console once, and falls back to the older globals for that call.
+
+Before 0.15.0 the lookup happened once at startup, so a page whose handler
+script ran later got no handlers at all for the rest of its life, with only a
+console warning to say why. If you are pinned below 0.15.0, define your global
+before the widget's own script tag.
 
 **The card is found by its media type.** A client matches
 `script[type="application/mcp-static-primitives+json"]`, so the element needs no
@@ -809,6 +831,47 @@ as **optional**, and fill them from page state where you can. An argument the
 visitor must type in makes the button useless to the visitor who needed it most:
 to press it, they would already have to know your form.
 
+## When a turn does not fit the model's context
+
+A model holds a fixed number of tokens. A long conversation, a large reference
+resource and a few big tool results can exceed it, and the provider then refuses
+the whole turn. The widget tries to keep a turn inside the limit instead, and
+tells the reader whenever it has to change something. You do not configure any
+of this, but your page's visitors will see the messages, so it is worth knowing
+what they mean.
+
+The widget learns each model's context window from the server's model list. If
+the server does not report one, none of the behaviour below applies and the turn
+is sent as it is.
+
+**One oversized tool result is shortened.** A single result may use at most 40%
+of the window. A larger one is cut to that size, and the model is told in the
+result itself how much was shown and that it can call the tool again with a
+narrower query. The panel says, for example:
+
+> Shortened an oversized togovar_search_variant result to fit the context:
+> 121,000 tokens, where one result may use at most 51,000. Ask again with a
+> narrower question for the complete result.
+
+**Older tool results are given up when the whole turn is too long.** This is for
+a conversation that has grown over many turns, not for one large result. The
+oldest results go first, one at a time, until the turn fits. The questions, the
+answers and the model's own summaries of what it read are never touched, and a
+dropped result leaves a note in its place so the model knows to ask again.
+
+**A reference resource that does not fit is not attached.** Each turn may carry
+about 6% of the window as reference data — roughly 8 KB for a 32,000-token model
+and 32 KB for a 128,000-token one. A resource larger than that is not fetched at
+all, and the panel says so, naming the resource and both figures. The model is
+not told, because it cannot fetch a resource itself; the reader can act, by
+choosing a model with a larger window or asking you for a smaller resource.
+
+If you publish a large document through MCP, consider offering it in sections
+behind one tool that takes a section name, rather than as a single tool result.
+The list of section names in the tool's own schema costs a few hundred tokens
+and is visible to every client, while a document of tens of kilobytes crowds out
+the conversation it is supposed to support.
+
 ## Further reading
 
 - **The static-primitives extension** — `io.modelcontextprotocol/static-primitives`,
@@ -853,3 +916,9 @@ within the limits. Rate/capacity limits honor Retry-After where available; daily
 budgets and operator stops advise waiting for reset/resumption. Resource-limit
 MCP rejections stop orchestration instead of being fed back for automatic retry;
 ordinary recoverable tool errors still reach the model for query correction.
+
+
+The [standalone anonymous MCP E2E fixture](test/e2e/README.md#standalone-anonymous-remote-mcp-round-trip)
+checks a static custom element against a live hub, or an explicit mock hub for
+wiring checks. It validates captured tool-result history rather than the model's
+claim that it called a tool, and leaves model generation defaults unchanged.

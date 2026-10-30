@@ -1,6 +1,6 @@
 {
   "name": "@aibranch/llm-meta-widget",
-  "version": "0.12.2",
+  "version": "0.15.2",
   "//version": "Must stay in step with lib/llm_meta_widget/version.rb. Two independently versioned copies of the same client is the drift docs/custom-element-distribution.md warns about: bump both, release both.",
   "description": "Embeddable browser chat widget: a custom element that discovers tools at page, origin and hub scope and dispatches each tool call to the right one. Two lines of HTML on any host, Rails or not.",
   "keywords": [
@@ -41,7 +41,7 @@
     "build": "node script/build.mjs",
     "lint": "eslint .",
     "test:js": "node script/build.mjs --check && node --test app/assets/javascripts/llm_meta_widget/*.test.mjs",
-    "test:rb": "ruby test/partial_render_test.rb && ruby test/attribute_roundtrip_test.rb",
+    "test:rb": "ruby test/partial_render_test.rb && ruby test/attribute_roundtrip_test.rb && ruby test/remote_tool_wire_test.rb",
     "test": "npm run test:js && npm run test:rb",
     "prepublishOnly": "npm run build && npm run test:js && npm run lint"
   },

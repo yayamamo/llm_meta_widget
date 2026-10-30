@@ -185,7 +185,35 @@ function boot(cfg, host) {
 
   	// Rounded to the nearest thousand and grouped, so the numbers read as a
   	// scale rather than as a precise count the estimate cannot support.
-  	function thousands(n) {
+  	// Reference data the budget refused, so the panel can say so on the next
+	// turn. NOT announced at boot: appendTurn persists, so a boot-time notice
+	// would be saved into the transcript and repeat on every reload.
+	//
+	// The model is not told, deliberately. It cannot fetch a resource — only the
+	// client reads those — so telling it would spend tokens on something it can
+	// do nothing about. The person CAN act: pick a model with more room, or ask
+	// the page author for a smaller reference.
+	var skippedResources = [];
+	var announcedSkips   = false;
+
+	function kb(bytes) { return Math.round((bytes || 0) / 1024) + " KB"; }
+
+	// `origin` is "page" for a page-card resource and "host" for one from a
+	// host-wide server. It matters when the budget changes: page resources are
+	// planned again, so their refusals are re-recorded, while a host resource is
+	// listed once at boot and never re-planned. Clearing both on a re-plan
+	// erased the host refusal before it could be reported — which silenced the
+	// case that matters most, since PubDictionaries' catalog arrives that way.
+	function noteSkippedResource(plan, budget, origin) {
+		// A resource the page marked autoAttach:false is a deliberate choice, not
+		// an omission — only a budget refusal is worth reporting.
+		if (plan.reason !== "over-budget") return;
+		var name = plan.name || plan.uri;
+		skippedResources = skippedResources.filter(function(s) { return s.name !== name; });
+		skippedResources.push({ name: name, size: plan.size, budget: budget, origin: origin });
+	}
+
+	function thousands(n) {
   		return (Math.round(n / 1000) * 1000).toLocaleString("en-US");
   	}
 
@@ -461,7 +489,11 @@ function boot(cfg, host) {
   			}));
   	} else {
   		var pageCardEl = document.getElementById(PAGE_CARD_ID);
-  		pageCard = readStaticPrimitivesCard(pageCardEl ? pageCardEl.textContent : null);
+  		// Through the merge as well, with one card: that is where a transport
+  		// declared twice is caught, and the escape hatch should not be the one
+  		// path where an authoring error goes unreported.
+  		pageCard = mergeStaticPrimitivesCards(
+  			[ readStaticPrimitivesCard(pageCardEl ? pageCardEl.textContent : null) ]);
   	}
   	// Where the page's handlers live. The card may declare a global, which is
 	// the only form an outside consumer can discover; the three legacy globals
@@ -584,9 +616,33 @@ function boot(cfg, host) {
   				});
   				if (flat.length > 1) modelPicker.style.display = "";
   			}));
-  		} else if (ENABLE_MODEL_PICKER && modelPicker) {
-        tasks.push(fetch(LLM_BASE + "/api/llms", { headers: hubHeaders() })
-  				.then(function(r) { return r.ok ? r.json() : { llms: [] }; })
+  		}
+  		// The hub answers with each model's context window, and every budget below
+  		// is derived from it, so ASK REGARDLESS OF THE PICKER. This used to sit
+  		// inside the picker branches: a page that pinned a model and hid the
+  		// picker — which is a sensible thing to do, and what the standalone E2E
+  		// fixture does — never learned the window at all. The resource budget then
+  		// fell to its 8 KB floor and both tool-result truncation and eviction stood
+  		// down, each returning its input unchanged without a window. No warning was
+  		// possible either, because no request was made to fail.
+  		//
+  		// Skipped only when talking straight to Ollama, which has no /api/llms.
+  		if (LLM_PROVIDER !== "ollama") {
+  			// cache: "no-store" so the browser never sends a conditional request. The
+  			// hub answers /api/llms with an ETag and must-revalidate, so a REPEAT visit
+  			// got 304 Not Modified — and Response.ok is false for a 304, which became
+  			// an empty payload here. The model's context window was then unknown, so
+  			// the resource budget fell to its 8 KB floor and BOTH tool-result
+  			// truncation and eviction stood down, each returning unchanged without a
+  			// window. It worked on a first load and quietly stopped on every one after.
+  			tasks.push(fetch(LLM_BASE + "/api/llms", { headers: hubHeaders(), cache: "no-store" })
+  				.then(function(r) {
+  					if (r.ok) return r.json();
+  					console.warn("[llm-meta-widget] /api/llms answered " + r.status +
+  					             "; the model context window is unknown, so reference data is" +
+  					             " budgeted at the floor and oversized tool results are not trimmed");
+  					return { llms: [] };
+  				})
   				.then(function(payload) {
   					// /api/llms is heterogeneous per family:
   					//   - OpenAI/Anthropic/Google: `models: [{ name, display_name, ... }]`
@@ -597,6 +653,13 @@ function boot(cfg, host) {
   					// configured model is often hosted while the picker shows local ones.
   					llmsPayload = payload;
   					modelWindow = modelWindowFrom(payload, MODEL);
+
+  					// The window is the part every page needs; filling the picker is only for
+  					// pages that show one, and the code below would dereference a null picker.
+					// Without this the TypeError only skips the rest of boot, whose
+					// remaining job is the picker's change handler — so nothing a
+					// no-picker page needs. Kept for intent, not for a visible bug.
+  					if (!(ENABLE_MODEL_PICKER && modelPicker)) return;
   					var flat = [];
   					(payload.llms || []).forEach(function(llm) {
   						if (llm.family !== "ollama") return;
@@ -633,8 +696,16 @@ function boot(cfg, host) {
   		}
 
   		if (ENABLE_TOOL_PICKER && toolsListEl) {
-        tasks.push(fetch(TOOL_HUB_BASE + "/api/mcp_servers", { headers: hubHeaders() })
-  				.then(function(r) { return r.ok ? r.json() : { mcp_servers: [] }; })
+  			// Same reason as /api/llms above: a 304 on a repeat visit emptied this, and
+  			// the panel then said "No hub-registered tools available" although the hub
+  			// had them.
+  			tasks.push(fetch(TOOL_HUB_BASE + "/api/mcp_servers", { headers: hubHeaders(), cache: "no-store" })
+  				.then(function(r) {
+  					if (r.ok) return r.json();
+  					console.warn("[llm-meta-widget] /api/mcp_servers answered " + r.status +
+  					             "; hub-registered tools will be listed as unavailable");
+  					return { mcp_servers: [] };
+  				})
   				.then(function(payload) {
   					hubMcpServers = (payload.mcp_servers || []).filter(function(s) {
   						return anyAllowedByAllowlist(s.name, HUB_TOOLS_ALLOWLIST);
@@ -794,6 +865,7 @@ function boot(cfg, host) {
   	// call answers, and null forever if the hub is older than the field — in
   	// which case the loop budgets nothing, exactly as it always did.
   	var modelWindow = null;
+  	var warnedNoWindow = false;
   	// The /api/llms answer, kept so switching model in the picker can resolve
   	// that model's window. Without it a visitor who switches from a 262k model
   	// to a 32k one keeps the big window — no eviction, and a resource budget
@@ -825,12 +897,19 @@ function boot(cfg, host) {
   		var budget = resourceBudget();
   		if (pageResourcePlans === null || budget !== pageResourcePlansBudget) {
   			pageResourcePlansBudget = budget;
+			// A different budget is a different decision: say it again. Only the
+			// page's own refusals are dropped — those are about to be re-recorded
+			// by the planning below. A host resource is listed once at boot, so
+			// discarding its refusal here would lose it for good.
+			skippedResources = skippedResources.filter(function(s) { return s.origin !== "page"; });
+			announcedSkips   = false;
   			pageResourcePlans = planPageResources({
   				entries:     pageCard.resources,
   				budgetBytes: budget,
   				onSkip: function(plan) {
   					console.info("[llm_meta_widget] not attaching " + plan.uri +
   					             " (" + plan.reason + ", size=" + plan.size + ")");
+  					             noteSkippedResource(plan, resourceBudget(), "page");
   				}
   			});
   		}
@@ -884,6 +963,7 @@ function boot(cfg, host) {
   					onSkip: function(plan) {
   						console.info("[llm_meta_widget] not attaching " + plan.uri +
   						             " (" + plan.reason + ", size=" + plan.size + ")");
+  						             noteSkippedResource(plan, resourceBudget(), "host");
   					}
   				});
   				// A volatile resource comes back with no context — it is read
@@ -1457,6 +1537,35 @@ function boot(cfg, host) {
     persistConversation();
   		inputEl.value = "";
   		appendTurn("user", userText, pendingTurnLabel);
+
+  		// An unknown window is not a small window: every budget below then uses a
+  		// floor, and oversized tool results are neither trimmed nor evicted. Say so
+  		// once, at the moment it affects an answer. Three separate causes have led
+  		// here — a 304 read as empty, a page that hid the model picker, and a model
+  		// the hub does not list — and the first two were silent for days.
+  		if (!modelWindow && !warnedNoWindow) {
+  			warnedNoWindow = true;
+  			console.warn("[llm-meta-widget] no context window known for " + MODEL +
+  			             "; reference data is budgeted at the floor and oversized tool" +
+  			             " results are not trimmed");
+  		}
+
+  		// Reference data that did not fit, reported once per budget, at the moment
+  		// it affects an answer rather than at boot.
+  		// Plan the page's resources first: the refusals are recorded while planning,
+  		// which otherwise happens later in the turn — after this check had already
+  		// looked at an empty list and said nothing.
+  		pageResourcePlansNow();
+  		if (skippedResources.length && !announcedSkips) {
+  			announcedSkips = true;
+  			var skipped = skippedResources[0];
+  			var others = skippedResources.length - 1;
+  			var alsoText = others > 0 ? " and " + others + " other reference" + (others > 1 ? "s" : "") : "";
+  			appendTurn("system", "Did not attach the " + skipped.name + " reference" + alsoText +
+  				" (" + kb(skipped.size) + ", and a " + MODEL + " turn allows " + kb(skipped.budget) +
+  				" for reference data), so the answer may be less precise." +
+  				" A model with a larger context window would make room.");
+  		}
   		pendingTurnLabel = null;
 
   		if (currentAbort) { try { currentAbort.abort(); } catch (e) { /* noop */ } }

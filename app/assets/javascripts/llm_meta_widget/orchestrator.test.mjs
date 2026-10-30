@@ -1759,18 +1759,18 @@ test("a card with no envelope is ignored, not guessed at", () => {
   // it the same document a Server Card carries.
   const card = readStaticPrimitivesCard(JSON.stringify({ tools: [ { name: "x" } ] }), quiet)
 
-  assert.deepEqual(card, { remotes: [], tools: [], prompts: [], resources: [] })
+  assert.deepEqual(card, { transports: [], remotes: [], tools: [], prompts: [], resources: [] })
 })
 
 test("malformed JSON costs the card, not the turn", () => {
   assert.deepEqual(readStaticPrimitivesCard("{not json", quiet),
-                   { remotes: [], tools: [], prompts: [], resources: [] })
+                   { transports: [], remotes: [], tools: [], prompts: [], resources: [] })
 })
 
 test("an absent card is simply empty", () => {
   for (const input of [ undefined, null, "", "   " ]) {
     assert.deepEqual(readStaticPrimitivesCard(input, quiet),
-                     { remotes: [], tools: [], prompts: [], resources: [] })
+                     { transports: [], remotes: [], tools: [], prompts: [], resources: [] })
   }
 })
 
@@ -1798,7 +1798,7 @@ test("a dropped entry is reported, so a typo is visible", () => {
 test("a non-array primitive list is tolerated", () => {
   const card = readStaticPrimitivesCard(CARD({ tools: "nonsense", resources: 7 }), quiet)
 
-  assert.deepEqual(card, { remotes: [], tools: [], prompts: [], resources: [] })
+  assert.deepEqual(card, { transports: [], remotes: [], tools: [], prompts: [], resources: [] })
 })
 
 // ---- page prompts -------------------------------------------------------
@@ -2114,7 +2114,7 @@ test("a tool and a prompt may share a name", () => {
 test("merging nothing yields empty arrays, not undefined", () => {
   const merged = mergeStaticPrimitivesCards(undefined, () => {})
 
-  assert.deepEqual(merged, { remotes: [], tools: [], prompts: [], resources: [] })
+  assert.deepEqual(merged, { transports: [], remotes: [], tools: [], prompts: [], resources: [] })
 })
 
 test("the media type is the one the spec names", () => {
@@ -2128,7 +2128,7 @@ test("the media type is the one the spec names", () => {
 // between the page and this widget, and they are configurable per page, so no
 // outside consumer could rely on them.
 
-const CARD_WITH_GLOBAL = { remotes: [ { type: "page-global", global: "mcp" } ] }
+const CARD_WITH_GLOBAL = { transports: [ { type: "page-global", global: "mcp" } ] }
 
 test("declaredPageGlobal reads the global the card declares", () => {
   assert.equal(declaredPageGlobal(CARD_WITH_GLOBAL), "mcp")
@@ -2140,13 +2140,13 @@ test("declaredPageGlobal ignores a transport of another type", () => {
   // rather than three handler maps. Dispatching maps against it would be
   // wrong, so the type check has to be what rejects it — not the absence of a
   // `global` field, which is all a streamable-http entry would have proved.
-  assert.equal(declaredPageGlobal({ remotes: [ { type: "page-jsonrpc", global: "mcp" } ] }), null)
-  assert.equal(declaredPageGlobal({ remotes: [ { type: "streamable-http", url: "https://x/mcp" } ] }), null)
+  assert.equal(declaredPageGlobal({ transports: [ { type: "page-jsonrpc", global: "mcp" } ] }, () => {}), null)
+  assert.equal(declaredPageGlobal({ transports: [ { type: "streamable-http", url: "https://x/mcp" } ] }, () => {}), null)
 })
 
 test("declaredPageGlobal ignores a blank or missing global name", () => {
-  assert.equal(declaredPageGlobal({ remotes: [ { type: "page-global", global: "  " } ] }), null)
-  assert.equal(declaredPageGlobal({ remotes: [ { type: "page-global" } ] }), null)
+  assert.equal(declaredPageGlobal({ transports: [ { type: "page-global", global: "  " } ] }, () => {}), null)
+  assert.equal(declaredPageGlobal({ transports: [ { type: "page-global" } ] }, () => {}), null)
   assert.equal(declaredPageGlobal({}), null)
   assert.equal(declaredPageGlobal(), null)
 })
@@ -2182,7 +2182,7 @@ test("each map falls back on its own, so a part-moved page keeps working", () =>
 
 test("a page that declares no transport uses the legacy globals", () => {
   const scope = { aiActions: { a: 1 }, aiPrompts: { b: 2 }, aiResources: { c: 3 } }
-  const h = pageHandlers({ card: { remotes: [] }, scope,
+  const h = pageHandlers({ card: { transports: [] }, scope,
                            legacy: { tools: "aiActions", prompts: "aiPrompts", resources: "aiResources" } })
 
   assert.deepEqual([ h.tools, h.prompts, h.resources ], [ { a: 1 }, { b: 2 }, { c: 3 } ])
@@ -2203,20 +2203,22 @@ test("pageHandlers called with nothing yields empty maps", () => {
 })
 
 test("a card's declared transport survives the parse", () => {
+  // Inside the extension data, which is where the parser reads it from.
   const card = readStaticPrimitivesCard(JSON.stringify({
     name: "org.example/page",
-    remotes: [ { type: "page-global", global: "mcp" } ],
-    _meta: { "io.modelcontextprotocol/static-primitives": { tools: [ { name: "t" } ] } }
+    _meta: { "io.modelcontextprotocol/static-primitives": {
+      transports: [ { type: "page-global", global: "mcp" } ], tools: [ { name: "t" } ]
+    } }
   }), () => {})
 
-  assert.equal(declaredPageGlobal(card), "mcp")
+  assert.equal(declaredPageGlobal(card, () => {}), "mcp")
 })
 
 test("two blocks declaring different globals keep the first and report it", () => {
   const said = []
   const merged = mergeStaticPrimitivesCards([
-    { remotes: [ { type: "page-global", global: "first" } ] },
-    { remotes: [ { type: "page-global", global: "second" } ] }
+    { transports: [ { type: "page-global", global: "first" } ] },
+    { transports: [ { type: "page-global", global: "second" } ] }
   ], (m) => said.push(m))
 
   assert.equal(declaredPageGlobal(merged), "first")
@@ -2243,8 +2245,15 @@ test("a declared global the page never defines is reported", () => {
   // Nearly always load order, or a script that threw before defining it — the
   // failure we hit for real on 2026-10-15 was exactly that shape.
   const said = []
-  pageHandlers({ card: CARD_WITH_GLOBAL, scope: {}, legacy: { tools: "aiActions" },
-                 warn: (m) => said.push(m) })
+  const handlers = pageHandlers({ card: CARD_WITH_GLOBAL, scope: {},
+                                  legacy: { tools: "aiActions" }, warn: (m) => said.push(m) })
+
+  // Nothing is said when the card is read: at that point the page's scripts may
+  // not have run, so a missing global is not yet news. It is news when a
+  // handler is actually wanted.
+  assert.deepEqual(said, [])
+
+  void handlers.tools
 
   assert.equal(said.length, 1)
   assert.match(said[0], /window\.mcp is not defined/)
@@ -2252,7 +2261,7 @@ test("a declared global the page never defines is reported", () => {
 
 test("a page that declares no transport is not warned about", () => {
   const said = []
-  pageHandlers({ card: { remotes: [] }, scope: { aiActions: {} },
+  pageHandlers({ card: { transports: [] }, scope: { aiActions: {} },
                  legacy: { tools: "aiActions" }, warn: (m) => said.push(m) })
 
   assert.deepEqual(said, [])
@@ -2640,4 +2649,155 @@ test("capping one result spares the others, which eviction would have dropped", 
   assert.deepEqual(dropped, [], "with the monster capped, nothing needs dropping")
   assert.equal(capped.messages[1].content.length, 220, "the small results are untouched")
   assert.equal(capped.messages[2].content.length, 220)
+})
+
+// --- the transport declaration moved (SEP d44bd25a) ----------------------
+//
+// It used to be top-level `remotes`. The Server Card's `Remote.type` enum is
+// streamable-http|sse, so `page-global` was never valid there; it now lives in
+// the extension data as `transports`, an array whose order is the author's
+// preference. `remotes` is read for one release so a page and a widget can move
+// in either order without the page going dark in between.
+
+const cardWith = (ext, top = {}) => JSON.stringify(Object.assign({}, top,
+  { _meta: { "io.modelcontextprotocol/static-primitives": ext } }))
+
+test("the global comes from transports inside the extension data", () => {
+  const card = readStaticPrimitivesCard(cardWith({
+    transports: [ { type: "page-global", global: "mcp" } ], tools: []
+  }))
+
+  assert.deepEqual(card.transports, [ { type: "page-global", global: "mcp" } ])
+  assert.equal(declaredPageGlobal(card, () => {}), "mcp")
+})
+
+test("the first supported transport wins, and an unsupported one before it is skipped", () => {
+  // Order is the author's preference: a supported entry must not be passed over
+  // for a later one, but an unsupported type is not a reason to stop looking.
+  const card = { transports: [
+    { type: "page-postmessage", global: "ignored" },
+    { type: "page-global", global: "first" },
+    { type: "page-global", global: "second" }
+  ] }
+
+  assert.equal(declaredPageGlobal(card, () => {}), "first")
+})
+
+test("a card offering only transports we cannot speak gets no handlers", () => {
+  // Reserved types exist in the spec; dispatching to the wrong global would be
+  // worse than not dispatching.
+  const said = []
+  const card = { transports: [ { type: "page-jsonrpc", global: "mcp" },
+                               { type: "page-worker", global: "mcp" } ] }
+
+  assert.equal(declaredPageGlobal(card, (m) => said.push(m)), null)
+  assert.match(said.join(" "), /none of which this widget supports/)
+  assert.match(said.join(" "), /page-jsonrpc/)
+})
+
+test("a card still using top-level remotes is reported, and gets no handlers", () => {
+  // 0.14.0 stopped reading it. Saying so matters: without the report the card
+  // would fall through to the legacy globals, and a page that deliberately
+  // defines none — PubDictionaries does not — would simply stop working.
+  const said = []
+  const card = readStaticPrimitivesCard(cardWith({ tools: [] },
+    { remotes: [ { type: "page-global", global: "mcp" } ] }))
+
+  assert.equal(declaredPageGlobal(card, (m) => said.push(m)), null)
+  assert.match(said.join(" "), /no longer read/)
+  assert.match(said.join(" "), /transports/)
+})
+
+test("transports decides when a page carries both, with nothing to report", () => {
+  const said = []
+  const card = readStaticPrimitivesCard(cardWith(
+    { transports: [ { type: "page-global", global: "current" } ], tools: [] },
+    { remotes: [ { type: "page-global", global: "old" } ] }))
+
+  assert.equal(declaredPageGlobal(card, (m) => said.push(m)), "current")
+  assert.deepEqual(said, [], "the page already declares the current spelling")
+})
+
+test("transports from several blocks concatenate in document order", () => {
+  const merged = mergeStaticPrimitivesCards([
+    { transports: [ { type: "page-postmessage", global: "a" } ], tools: [], prompts: [], resources: [] },
+    { transports: [ { type: "page-global", global: "b" } ], tools: [], prompts: [], resources: [] }
+  ], () => {})
+
+  assert.deepEqual(merged.transports.map((t) => t.type), [ "page-postmessage", "page-global" ])
+  assert.equal(declaredPageGlobal(merged, () => {}), "b")
+})
+
+test("two blocks naming different globals for one type is reported, first kept", () => {
+  const said = []
+  const merged = mergeStaticPrimitivesCards([
+    { transports: [ { type: "page-global", global: "first" } ], tools: [], prompts: [], resources: [] },
+    { transports: [ { type: "page-global", global: "second" } ], tools: [], prompts: [], resources: [] }
+  ], (m) => said.push(m))
+
+  assert.equal(merged.transports.length, 1)
+  assert.equal(declaredPageGlobal(merged, () => {}), "first")
+  assert.match(said.join(" "), /page-global transport is declared more than once/)
+})
+
+// SEP: handler availability is a runtime binding. An HTML-delivered card is
+// parsed from the DOM before the page's own scripts have necessarily run, so
+// resolving the global once at discovery and keeping the result is wrong — the
+// page would silently have no handlers for the rest of its life.
+
+test("a global defined after the card was read is still found", () => {
+  const scope = {}
+  const handlers = pageHandlers({ card: CARD_WITH_GLOBAL, scope,
+                                  legacy: { tools: "aiActions" }, warn: () => {} })
+
+  assert.deepEqual(handlers.tools, {}, "nothing to dispatch to yet")
+
+  // the page's script runs now, as it would with defer, a module, or an
+  // injected consumer that got there first
+  scope.mcp = { tools: { annotate: () => "ok" } }
+
+  assert.equal(typeof handlers.tools.annotate, "function",
+               "the handler map must be resolved at dispatch, not cached at discovery")
+})
+
+test("a global that disappears falls back again rather than serving a stale map", () => {
+  const scope = { mcp: { tools: { t: () => "ok" } }, aiActions: { legacy: () => "old" } }
+  const handlers = pageHandlers({ card: CARD_WITH_GLOBAL, scope,
+                                  legacy: { tools: "aiActions" }, warn: () => {} })
+
+  assert.equal(typeof handlers.tools.t, "function")
+  delete scope.mcp
+
+  assert.equal(typeof handlers.tools.legacy, "function", "re-resolved, not remembered")
+})
+
+test("the missing-global report is said once, not on every dispatch", () => {
+  // It now fires on access, and a page that never defines its global would
+  // otherwise repeat it for every tool, prompt and resource lookup, every turn.
+  const said = []
+  const handlers = pageHandlers({ card: CARD_WITH_GLOBAL, scope: {},
+                                  legacy: { tools: "aiActions" }, warn: (m) => said.push(m) })
+
+  void handlers.tools
+  void handlers.tools
+  void handlers.prompts
+
+  assert.equal(said.length, 1, said.join(" | "))
+})
+
+test("the report about the old spelling reaches a caller's own warn", () => {
+  // pageHandlers takes a warn so a host can route messages. A report that went
+  // straight to console.warn would bypass it and be invisible to anyone
+  // collecting warnings — and this is the one that explains why a migrated page
+  // suddenly has no handlers.
+  const said = []
+  const handlers = pageHandlers({
+    card: { remotes: [ { type: "page-global", global: "mcp" } ] },
+    scope: { mcp: { tools: { t: () => "ok" } }, aiActions: {} },
+    legacy: { tools: "aiActions" },
+    warn: (m) => said.push(m)
+  })
+
+  assert.equal(handlers.global, null, "the old spelling is not read any more")
+  assert.match(said.join(" "), /no longer read/)
 })

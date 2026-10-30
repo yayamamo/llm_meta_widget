@@ -22,10 +22,18 @@ const HUB = "https://hub.example"
 let hubServers = []
 let streamScript = null
 let sentBodies = []
+// Every fetch the element makes, so a test can assert HOW it asked and not
+// only what came back. The 304 bug was invisible to the payload alone.
+let fetchLog = []
+// A status to answer /api/llms with instead of 200, for one test.
+let hubLlmsStatus = null
 // Set to override the /api/llms answer for one test.
 let hubLlms = null
 // What a hub-proxied tool call answers, for a test that needs a big one.
 let hubToolResult = { ok: true }
+// A host-wide manifest, and what its resources/list answers.
+let hostManifest = { servers: [] }
+let hostResources = []
 
 function installGlobals() {
   const dom = new JSDOM("<!doctype html><html><body></body></html>", { url: "https://host.example/page" })
@@ -38,6 +46,7 @@ function installGlobals() {
   globalThis.requestAnimationFrame = (fn) => setTimeout(fn, 0)
   globalThis.fetch = async (url, init = {}) => {
     const u = String(url)
+    fetchLog.push({ url: u, init })
     if (u.includes("single_llm_calls")) {
       sentBodies.push(JSON.parse(init.body || "{}"))
       // A test can script the stream, one entry per round, to exercise a tool
@@ -66,14 +75,41 @@ function installGlobals() {
       }
       return new Response(body, sse)
     }
-    const json = (body) => ({ ok: true, status: 200, json: async () => body, text: async () => JSON.stringify(body) })
-    if (u.includes("/api/llms"))        return json(hubLlms || { llms: [ { models: [ { value: "m1" }, { value: "m2" } ] } ] })
+    // `headers` matters: mcpRpc reads content-type, and a response without it
+    // throws — which listMcpResources swallows, so an MCP path would behave as
+    // if the server had returned nothing at all.
+    const json = (body) => ({
+    	ok: true, status: 200,
+    	headers: { get: (k) => (String(k).toLowerCase() === "content-type" ? "application/json" : null) },
+    	json: async () => body, text: async () => JSON.stringify(body)
+    })
+    if (u.includes("/api/llms")) {
+    	if (hubLlmsStatus && hubLlmsStatus !== 200) {
+    		// A 304 carries no body, which is the whole point: Response.ok is
+    		// false and r.json() would throw.
+    		return { ok: false, status: hubLlmsStatus, headers: { get: () => null },
+    		         json: async () => { throw new Error("no body on " + hubLlmsStatus) } }
+    	}
+    	return json(hubLlms || { llms: [ { models: [ { value: "m1" }, { value: "m2" } ] } ] })
+    }
     if (/\/api\/mcp_servers\/[^/]+\/tools/.test(u)) {
       const uuid = u.match(/mcp_servers\/([^/]+)\/tools/)[1]
       const s = hubServers.find((x) => x.uuid === uuid)
       return json({ tools: (s && s.tools) || [] })
     }
     if (u.includes("/api/mcp_servers")) return json({ mcp_servers: hubServers })
+    // A host-wide (Class 2) server: a well-known manifest naming an endpoint,
+    // plus JSON-RPC at that endpoint. `hostResources` is what resources/list
+    // answers, so a test can offer an oversized reference.
+    if (u.includes("/.well-known/mcp.json")) return json(hostManifest)
+    if (u.includes("/host-mcp")) {
+    	const rpc = JSON.parse(init.body || "{}")
+    	if (rpc.method === "resources/list") return json({ result: { resources: hostResources } })
+    	if (rpc.method === "resources/read") {
+    		return json({ result: { contents: [ { uri: rpc.params && rpc.params.uri, text: "R".repeat(200) } ] } })
+    	}
+    	return json({ result: {} })
+    }
     // A hub-proxied tool's real result goes back to the model, unlike a page
     // action's (the loop reports only {ok, applied} for those) — so this is the
     // only path a test can use to put a large result in the context.
@@ -106,7 +142,7 @@ before(() => { assert.ok(customElements.get("llm-meta-widget"), "the bundle shou
 // without this a test restores the previous test's conversation — which made an
 // assertion about "the saved question" read a question from two tests ago.
 beforeEach(() => {
-  hubServers = []; sentBodies = []; hubLlms = null; streamScript = null; hubToolResult = { ok: true }
+  hubServers = []; sentBodies = []; hubLlms = null; fetchLog = []; hubLlmsStatus = null; streamScript = null; hubToolResult = { ok: true }; hostManifest = { servers: [] }; hostResources = []
   try { window.sessionStorage.clear() } catch { /* storage may be unavailable */ }
 })
 
@@ -814,8 +850,9 @@ test("a card carrying both the media type and the legacy id is read once", async
 
 async function mountWithGlobal(ext) {
   document.body.innerHTML = ""
-  putTypedCard(ext, { name: "org.example/page",
-                      remotes: [ { type: "page-global", global: "mcp" } ] })
+  // transports lives INSIDE the extension data, not at the card's top level.
+  putTypedCard(Object.assign({ transports: [ { type: "page-global", global: "mcp" } ] }, ext),
+               { name: "org.example/page" })
   const el = document.createElement("llm-meta-widget")
   for (const [ k, v ] of Object.entries({ "llm-url": HUB, model: "m1", "well-known-urls": "" })) {
     el.setAttribute(k, v)
@@ -832,6 +869,35 @@ test("a tool declared with a page-global transport dispatches to that global", a
 
   assert.deepEqual(await localToolsAfterATurn(), [ "from_global" ])
   delete window.mcp
+})
+
+test("the escape-hatch card is checked for a duplicate transport too", async () => {
+  // boot() routes even a single typed block through the merge, which is where a
+  // transport declared twice is caught and the first kept. The id-addressed
+  // escape hatch used to skip the merge, which made it the one path where that
+  // authoring error went unreported.
+  document.body.innerHTML = ""
+  putCard({
+    transports: [ { type: "page-global", global: "first" },
+                  { type: "page-global", global: "second" } ],
+    tools: [ { name: "t", description: "d", inputSchema: {} } ]
+  })
+
+  const said = []
+  const realWarn = console.warn
+  console.warn = (m) => said.push(String(m))
+  try {
+    const el = document.createElement("llm-meta-widget")
+    for (const [ k, v ] of Object.entries({ "llm-url": HUB, model: "m1", "well-known-urls": "" })) {
+      el.setAttribute(k, v)
+    }
+    document.body.appendChild(el)
+    await tick(60)
+  } finally {
+    console.warn = realWarn
+  }
+
+  assert.match(said.join(" "), /declared more than once/)
 })
 
 test("a prompt resolves through the declared global", async () => {
@@ -940,6 +1006,152 @@ test("what the assistant said before the tool call is in storage too", async () 
 
 // --- budgeting the turn against the model's real window -----------------
 //
+// A repeat visit is the normal case, and it was the broken one. The hub answers
+// /api/llms and /api/mcp_servers with an ETag and must-revalidate, so the second
+// page load sends a conditional request and gets 304 Not Modified. Response.ok
+// is false for a 304, and the handlers turned that into an empty payload: no
+// context window, so the resource budget fell to its floor and both tool-result
+// truncation and eviction stood down, and no hub tools, so the panel said there
+// were none. It worked on a first load and silently stopped on every one after.
+
+// Found while reviewing the standalone E2E fixture (widget PR #1), whose page
+// sets enable-model-picker="false" — a sensible choice when the host pins one
+// model. Both /api/llms fetches used to sit inside the picker branches, so such
+// a page never learned the model's context window: the resource budget fell to
+// its 8 KB floor and tool-result truncation and eviction both stood down, each
+// returning its input unchanged without a window. Unlike the 304 version of
+// this bug, no warning was even possible, because no request was made to fail.
+
+test("says so at turn time when no context window is known", async () => {
+  // The audible backstop. Three different causes have produced an unknown
+  // window — a 304 read as an empty payload, a page that hid the model picker,
+  // and a model the hub does not list — and the first two were silent for days
+  // because each was reported, if at all, only where it happened. This fires
+  // wherever the cause was, at the moment it affects an answer.
+  hubLlms = { llms: [ { family: "bedrock", models: [ { name: "someone-else", max_input_tokens: 128000 } ] } ] }
+  const said = []
+  const realWarn = console.warn
+  console.warn = (m) => said.push(String(m))
+  try {
+    document.body.innerHTML = ""
+    const el = document.createElement("llm-meta-widget")
+    for (const [ k, v ] of Object.entries({ "llm-url": HUB, model: "m1", "well-known-urls": "" })) {
+      el.setAttribute(k, v)
+    }
+    document.body.appendChild(el)
+    await tick(60)
+    const panel = document.getElementById("llm-meta-widget-chat")
+    const input = panel.querySelector(".lmw-input")
+    input.value = "hello"
+    input.dispatchEvent(new window.Event("input", { bubbles: true }))
+    panel.querySelector(".lmw-form").dispatchEvent(new window.Event("submit", { bubbles: true, cancelable: true }))
+    await tick(120)
+  } finally {
+    console.warn = realWarn
+  }
+
+  assert.match(said.join(" "), /no context window known for m1/)
+})
+
+test("learns the context window even when the page hides the model picker", async () => {
+  hubLlms = { llms: [ { family: "bedrock", models: [
+    { name: "m1", supports_tools: true, max_input_tokens: 128000 }
+  ] } ] }
+  document.body.innerHTML = ""
+  const el = document.createElement("llm-meta-widget")
+  for (const [ k, v ] of Object.entries({ "llm-url": HUB, model: "m1", "well-known-urls": "",
+                                          "enable-model-picker": "false" })) {
+    el.setAttribute(k, v)
+  }
+  document.body.appendChild(el)
+  await tick(60)
+
+  const llms = fetchLog.find((c) => c.url.includes("/api/llms"))
+  assert.ok(llms, "the window is what every budget is derived from, picker or no picker")
+
+  // A no-picker page must also be able to hold a conversation, which is the
+  // part a visitor would notice. Note what this does NOT cover: removing the
+  // guard below on the picker-population code throws a TypeError after this
+  // request has gone out, which skips the rest of boot — but the only thing
+  // after it is the picker's change handler, which such a page has no use for,
+  // so a turn still works and no assertion here can see the difference.
+  const panel = document.getElementById("llm-meta-widget-chat")
+  const input = panel.querySelector(".lmw-input")
+  input.value = "hello"
+  input.dispatchEvent(new window.Event("input", { bubbles: true }))
+  panel.querySelector(".lmw-form").dispatchEvent(new window.Event("submit", { bubbles: true, cancelable: true }))
+  await tick(120)
+
+  assert.ok(sentBodies.length > 0, "a page with no picker must still be able to send a turn")
+})
+
+test("still fills the picker when the page shows one", async () => {
+  hubLlms = { llms: [ { family: "ollama", available_models: [
+    { value: "m1", label: "m1", supports_tools: true, max_input_tokens: 32768 },
+    { value: "m2", label: "m2", supports_tools: true, max_input_tokens: 32768 }
+  ] } ] }
+  document.body.innerHTML = ""
+  const el = document.createElement("llm-meta-widget")
+  for (const [ k, v ] of Object.entries({ "llm-url": HUB, model: "m1", "well-known-urls": "" })) {
+    el.setAttribute(k, v)
+  }
+  document.body.appendChild(el)
+  await tick(60)
+
+  const options = document.querySelectorAll(".lmw-model-picker option")
+  assert.ok(options.length >= 2, `expected the picker to be filled, got ${options.length} option(s)`)
+})
+
+test("asks for the model list without a conditional request", async () => {
+  document.body.innerHTML = ""
+  const el = document.createElement("llm-meta-widget")
+  for (const [ k, v ] of Object.entries({ "llm-url": HUB, model: "m1", "well-known-urls": "" })) {
+    el.setAttribute(k, v)
+  }
+  document.body.appendChild(el)
+  await tick(60)
+
+  const llms = fetchLog.find((c) => c.url.includes("/api/llms"))
+  assert.ok(llms, "the element must ask for the model list at all")
+  assert.equal(llms.init && llms.init.cache, "no-store",
+               "a cached ETag would make the browser send a conditional request and get a bodyless 304")
+})
+
+test("asks for the hub tool list without a conditional request", async () => {
+  document.body.innerHTML = ""
+  const el = document.createElement("llm-meta-widget")
+  for (const [ k, v ] of Object.entries({ "llm-url": HUB, "tool-hub-url": HUB, model: "m1", "well-known-urls": "" })) {
+    el.setAttribute(k, v)
+  }
+  document.body.appendChild(el)
+  await tick(60)
+
+  const servers = fetchLog.find((c) => c.url.includes("/api/mcp_servers") && !c.url.includes("/tools"))
+  assert.ok(servers, "the element must ask for the hub tool list at all")
+  assert.equal(servers.init && servers.init.cache, "no-store")
+})
+
+test("says so when the model list cannot be read, instead of budgeting at the floor in silence", async () => {
+  hubLlmsStatus = 304
+  const said = []
+  const realWarn = console.warn
+  console.warn = (m) => said.push(String(m))
+  try {
+    document.body.innerHTML = ""
+    const el = document.createElement("llm-meta-widget")
+    for (const [ k, v ] of Object.entries({ "llm-url": HUB, model: "m1", "well-known-urls": "" })) {
+      el.setAttribute(k, v)
+    }
+    document.body.appendChild(el)
+    await tick(60)
+  } finally {
+    console.warn = realWarn
+  }
+
+  assert.match(said.join(" "), /\/api\/llms answered 304/)
+  assert.match(said.join(" "), /context window is unknown/)
+})
+
 // These drive the whole path: /api/llms reports a window, the element hands it
 // to the loop, and the loop gives up an old tool result rather than letting the
 // provider refuse the round. A unit test of evictOldToolResults cannot see any
@@ -1610,4 +1822,170 @@ test("the round cap displays a possible retry rather than implying a complete an
   await tick(250)
   assert.match(panel.textContent,/上限（1回）.*未完了.*改めて実行.*制限内で完了する場合/)
   assert.equal(sentBodies.length,1)
+})
+
+// --- reference data that did not fit --------------------------------------
+//
+// It used to vanish with only a console line: the model answered from less than
+// the page offered and nobody was told. The MODEL is deliberately not told —
+// it cannot fetch a resource, so the notice would cost tokens for nothing —
+// but the reader can act on it.
+
+async function turnWithAnOversizedResource(declaredSize) {
+  hubLlms = { llms: [ { family: "ollama", available_models: [
+    { value: "m1", label: "m1", supports_tools: true, max_input_tokens: 32_768 }
+  ] } ] }
+  globalThis.window.aiResources = { "page:big_ref": () => "R".repeat(declaredSize) }
+  await mountWithPage({ card: { resources: [
+    { uri: "page:big_ref", name: "BigRef", description: "a large reference", size: declaredSize }
+  ] } })
+  const panel = document.getElementById("llm-meta-widget-chat")
+  const system = await systemPromptAfterATurn(panel)
+  delete globalThis.window.aiResources
+  return { panel, system }
+}
+
+test("a reference refused for size is reported to the reader", async () => {
+  // 20,000 bytes against a 32k model's 8,192-byte budget.
+  const { panel, system } = await turnWithAnOversizedResource(20_000)
+
+  assert.match(panel.textContent, /Did not attach the BigRef reference/)
+  assert.match(panel.textContent, /20 KB/)
+  assert.match(panel.textContent, /8 KB for reference data/)
+  assert.match(panel.textContent, /larger context window/)
+  assert.doesNotMatch(system, /Did not attach/, "the model is not told: it cannot act on it")
+})
+
+test("the notice is given once, not on every turn", async () => {
+  // The budget has not changed between the turns, so the refusal is the same
+  // fact twice — saying it again would be noise in somebody else's page.
+  const { panel } = await turnWithAnOversizedResource(20_000)
+  globalThis.window.aiResources = { "page:big_ref": () => "R".repeat(20_000) }
+  await systemPromptAfterATurn(panel)
+  delete globalThis.window.aiResources
+
+  const said = (panel.textContent.match(/Did not attach the BigRef/g) || []).length
+  assert.equal(said, 1, `two turns, one notice — got ${said}`)
+})
+
+test("a reference that fits produces no notice", async () => {
+  const { panel } = await turnWithAnOversizedResource(2_000)
+
+  assert.doesNotMatch(panel.textContent, /Did not attach/)
+})
+
+test("a reference the page withholds on purpose is not reported", async () => {
+  // autoAttach:false is the page author's decision, not an omission.
+  hubLlms = { llms: [ { family: "ollama", available_models: [
+    { value: "m1", label: "m1", supports_tools: true, max_input_tokens: 32_768 } ] } ] }
+  globalThis.window.aiResources = { "page:held": () => "small" }
+  await mountWithPage({ card: { resources: [
+    { uri: "page:held", name: "Held", description: "d", size: 100,
+      _meta: { "io.modelcontextprotocol/static-primitives": { autoAttach: false } } }
+  ] } })
+  const panel = document.getElementById("llm-meta-widget-chat")
+  await systemPromptAfterATurn(panel)
+
+  assert.doesNotMatch(panel.textContent, /Did not attach/)
+  delete globalThis.window.aiResources
+})
+
+test("a host-wide reference refused for size is reported too", async () => {
+  // This is the path PubDictionaries' catalog takes — a resource from a
+  // host-wide MCP server, not from the page card. Both paths record a refusal,
+  // and only a test per path can show it.
+  hubLlms = { llms: [ { family: "ollama", available_models: [
+    { value: "m1", label: "m1", supports_tools: true, max_input_tokens: 32_768 } ] } ] }
+  // The manifest publishes servers with their tools; endpoints are learned
+  // from it, which is how the resource listing is reached at all.
+  hostManifest = { servers: [ { url: "https://host.example/host-mcp",
+                                tools: [ { name: "search", description: "d", input_schema: {} } ] } ] }
+  // mimeType matters: loadHostResource only considers application/json, so a
+  // fixture without it offers no candidate and the test proves nothing.
+  hostResources = [ { uri: "catalog://dictionaries", name: "Dictionary catalog",
+                      description: "every dictionary", size: 40_000,
+                      mimeType: "application/json" } ]
+
+  const panel = await mount({ "well-known-urls": "https://host.example/.well-known/mcp.json" }, 300)
+  panel.querySelector("textarea").value = "which dictionaries exist"
+  panel.querySelector("form").dispatchEvent(new window.Event("submit", { bubbles: true, cancelable: true }))
+  await tick(250)
+
+  assert.match(panel.textContent, /Did not attach the Dictionary catalog reference/)
+  assert.match(panel.textContent, /39 KB/)
+})
+
+test("a second refusal is counted, not listed one by one", async () => {
+  globalThis.window.aiResources = {
+    "page:a": () => "A".repeat(20_000), "page:b": () => "B".repeat(20_000)
+  }
+  hubLlms = { llms: [ { family: "ollama", available_models: [
+    { value: "m1", label: "m1", supports_tools: true, max_input_tokens: 32_768 } ] } ] }
+  await mountWithPage({ card: { resources: [
+    { uri: "page:a", name: "RefA", description: "d", size: 20_000 },
+    { uri: "page:b", name: "RefB", description: "d", size: 20_000 }
+  ] } })
+  const panel = document.getElementById("llm-meta-widget-chat")
+  await systemPromptAfterATurn(panel)
+
+  assert.match(panel.textContent, /Did not attach the RefA reference and 1 other reference/)
+  delete globalThis.window.aiResources
+})
+
+test("switching to a model with less room reports the refusal again", async () => {
+  // The budget follows the model, so the same reference can be affordable on
+  // one and not on the next. Saying it once per session would leave a reader
+  // who switched down wondering why the answer got vaguer.
+  hubLlms = { llms: [ { family: "ollama", available_models: [
+    { value: "m1", label: "roomy", supports_tools: true, max_input_tokens: 1_000_000 },
+    { value: "m2", label: "tight", supports_tools: true, max_input_tokens: 32_768 }
+  ] } ] }
+  globalThis.window.aiResources = { "page:big_ref": () => "R".repeat(20_000) }
+  await mountWithPage({ card: { resources: [
+    { uri: "page:big_ref", name: "BigRef", description: "d", size: 20_000 }
+  ] } })
+  const panel = document.getElementById("llm-meta-widget-chat")
+
+  const before = await systemPromptAfterATurn(panel)
+  assert.match(before, /RRRR/, "the roomy model affords it, so no notice yet")
+  assert.doesNotMatch(panel.textContent, /Did not attach/)
+
+  const picker = panel.querySelector("select")
+  picker.value = "m2"
+  picker.dispatchEvent(new window.Event("change", { bubbles: true }))
+  await systemPromptAfterATurn(panel)
+
+  assert.match(panel.textContent, /Did not attach the BigRef reference/,
+    "after switching down, the reference no longer fits and the reader is told")
+  delete globalThis.window.aiResources
+})
+
+test("switching between two models that both refuse says it again, with the new figures", async () => {
+  // Once-per-budget, not once-per-session. A reader who switches and still does
+  // not get the reference should be told under the new budget — otherwise the
+  // first notice looks like it was dealt with.
+  hubLlms = { llms: [ { family: "ollama", available_models: [
+    { value: "m1", label: "small", supports_tools: true, max_input_tokens: 32_768 },
+    { value: "m2", label: "medium", supports_tools: true, max_input_tokens: 48_000 }
+  ] } ] }
+  globalThis.window.aiResources = { "page:big_ref": () => "R".repeat(20_000) }
+  await mountWithPage({ card: { resources: [
+    { uri: "page:big_ref", name: "BigRef", description: "d", size: 20_000 }
+  ] } })
+  const panel = document.getElementById("llm-meta-widget-chat")
+
+  await systemPromptAfterATurn(panel)
+  assert.equal((panel.textContent.match(/Did not attach the BigRef/g) || []).length, 1,
+    "refused on the 32k model")
+
+  const picker = panel.querySelector("select")
+  picker.value = "m2"
+  picker.dispatchEvent(new window.Event("change", { bubbles: true }))
+  await systemPromptAfterATurn(panel)
+
+  // 48,000 * 6.25% * 4 = 12,000 bytes, still short of 20,000.
+  assert.equal((panel.textContent.match(/Did not attach the BigRef/g) || []).length, 2,
+    "and refused again on the 48k model, under its own budget")
+  assert.match(panel.textContent, /12 KB for reference data/)
+  delete globalThis.window.aiResources
 })

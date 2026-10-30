@@ -3,6 +3,184 @@
 This file starts at 0.8.0, the first release with a breaking change worth
 calling out. Earlier releases are in the git history (`git log --oneline v0.7.6`).
 
+## 0.15.2
+
+### A page that hides the model picker now learns the context window too
+
+Both requests for the hub's model list sat inside the branches that fill the
+model picker. A page that pins one model and hides the picker therefore never
+learned that model's context window — and hiding the picker is a reasonable
+choice when the host has already chosen the model.
+
+Without a window the resource budget falls back to its 8 KB floor, so a page's
+reference data is reported as skipped even when it would have fitted, and
+oversized tool results are neither trimmed nor evicted, because each of those
+steps returns its input unchanged when it has no window to spend. Release
+0.15.1 could not even warn about it: the warning there fires when a request
+comes back unusable, and here no request was made.
+
+The model list is now fetched whenever the hub is the provider, and only
+filling the picker remains conditional. A page configured to talk straight to
+Ollama is left alone, since there is no such endpoint to ask.
+
+The widget also says so once, in the browser console, if a turn starts with no
+known window — naming the model and what is lost. Three different causes have
+produced an unknown window so far, and each was reported only where it
+happened, if at all.
+
+## 0.15.1
+
+### A repeat visit no longer loses the model's context window or the hub tools
+
+The hub answers `/api/llms` and `/api/mcp_servers` with an ETag and
+`must-revalidate`, so a browser revalidated them on the second page load and
+got `304 Not Modified`. `Response.ok` is false for a 304, and both handlers
+turned that into an empty payload.
+
+Nothing announced it. Without the model's context window the resource budget
+fell to its 8 KB floor, so a page's reference data was reported as skipped even
+when it would have fitted; and tool-result truncation and oldest-result
+eviction both stood down, because each returns its input unchanged when it has
+no window to spend. An empty hub list meanwhile showed as "No hub-registered
+tools available". It all worked on a first load and stopped on every one after,
+which is why a hard reload always looked fine.
+
+Both requests now set `cache: "no-store"`, so no conditional request is sent
+and the answer always carries a body. A response that is not ok is reported in
+the browser console, naming what is lost, rather than being treated as an empty
+result.
+
+The hub stopped sending those ETags as well, so this release is not required to
+fix a page served by an up-to-date hub. It matters for any other server that
+does send them, and for making the next failure audible.
+
+## 0.15.0
+
+### The declared global is resolved when a handler is needed, not at startup
+
+A page card is parsed from the DOM before the page's own scripts have
+necessarily run, and a consumer may be injected before them. Until now the
+widget looked up the global named by the card's `page-global` transport once, at
+startup, and kept the result: a page whose handler script ran later — with
+`defer`, as an ES module, or from a `<script>` near the end of the document —
+got no handlers at all for the rest of its life, with only a console warning to
+explain it.
+
+The lookup now happens each time a handler is wanted, so script order no longer
+matters. A global defined after the card was read is found; a global that
+disappears falls back to the older globals again instead of serving a stale map.
+
+The "declares a global the page never defines" message moved with it. At startup
+it was a false alarm, because the defining script may simply not have run yet;
+it is now said when a handler is actually wanted, and said once rather than on
+every lookup.
+
+This is what SEP-0000 asks of a consumer: handler availability is a runtime
+binding, and the burden sits on the consumer, which is the side that can know
+its own injection timing.
+
+### Two smaller fixes from the same conformance audit
+
+- A transport type declared twice was reported as "two blocks declare different
+  globals" even when a single block declared it twice. The message now covers
+  both cases.
+- A card addressed by `page_card_id:` — the escape hatch for a host that cannot
+  set the media type — was read without the merge step, which is where a
+  duplicated transport is caught. It was therefore the one path where that
+  authoring error went unreported. It now goes through the same check.
+
+Nothing a conformant page declares behaves differently, and no card needs
+changing.
+
+## 0.14.0
+
+### Breaking: a transport declared in top-level `remotes` is no longer read
+
+0.13.0 moved the declaration into
+`_meta["io.modelcontextprotocol/static-primitives"].transports` and kept reading
+the old top-level `remotes` list, with a warning, so that a page and a widget
+could be updated in either order. That transition is over.
+
+**If your page card still declares its transport in `remotes`, move it to
+`transports` before taking this release.** A card that still carries the old
+spelling gets no handlers from the card: the widget falls back to
+`window.aiActions`, `window.aiPrompts` and `window.aiResources`, which is
+nothing at all for a page that does not define them. The widget reports the
+situation in the browser console rather than leaving you to find it, but it
+cannot dispatch.
+
+Nothing else changed. If your card already declares `transports`, this release
+behaves exactly like 0.13.1.
+
+## 0.13.1
+
+### Documentation: the README caught up with 0.12.x and 0.13.0
+
+Three examples and two explanations still told a page author to declare the
+transport in a top-level `remotes` list. Following the README would have
+produced a card this version warns about and a later version will stop reading.
+They now use `transports` inside the extension data, and say that the list is
+read in order and that the first supported type wins.
+
+The README also said nothing about what the widget does when a turn does not fit
+the model's context, although every part of that behaviour shipped in 0.12.x and
+puts messages in the panel that a page's visitors will read. There is now a
+section describing the three cases — one oversized tool result shortened, older
+results given up, a reference resource refused for its size — with the wording
+the reader actually sees.
+
+No code changed in this release.
+
+## 0.13.0
+
+### Changed: a page card declares its transport in `transports`, not `remotes`
+
+The declaration that says how to reach a page's handlers has moved, following
+SEP revision d44bd25a. It is now an array inside the extension data:
+
+```json
+{
+  "_meta": {
+    "io.modelcontextprotocol/static-primitives": {
+      "transports": [ { "type": "page-global", "global": "mcp" } ],
+      "tools": [], "prompts": [], "resources": []
+    }
+  }
+}
+```
+
+The reason is that the Server Card's `Remote.type` can only be
+`streamable-http` or `sse`, so `page-global` was never a valid value at the top
+level. It is an array because a page may come to offer more than one page-local
+transport, and the order is the author's preference.
+
+The widget reads the array in order and uses the first type it supports. It
+will not skip a supported entry for a later one. Only `page-global` is
+supported today; a card offering only `page-postmessage`, `page-jsonrpc` or
+`page-worker` gets no handlers rather than the wrong ones, and says so.
+
+**Top-level `remotes` still works in this release**, with a warning, so a page
+and a widget can be updated in either order without the page losing its tools
+in between. Move to `transports`; a later release will drop the fallback. If a
+page declares both, `transports` decides and nothing is reported.
+
+
+### Added: the panel says when reference data did not fit
+
+A resource refused by the budget used to disappear with nothing but a line in
+the browser console: the model answered from less than the page offered, and
+nobody was told. The panel now reports it, naming the resource, its size and
+what the model allows — once per budget, on the first turn it affects, and
+again if a different model changes the figures.
+
+The model is deliberately NOT told. It cannot fetch a resource — only the
+client reads those — so telling it would spend context on something it can do
+nothing about. The reader can act: choose a model with a larger window, or ask
+the page author for a smaller reference.
+
+A resource the page withholds on purpose (`autoAttach: false`) is not reported,
+since that is the author's choice rather than an omission.
+
 ## 0.12.2
 
 ### Changed: one oversized tool result is shortened, not paid for by the others
